@@ -1,0 +1,40 @@
+{
+  "name": "identity_server",
+  "version": "1.0.0",
+  "description": "passonym identity server",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "tsx watch src/app.ts",
+    "start": "tsx src/app.ts"
+  },
+  "author": "mareiski",
+  "license": "ISC",
+  "dependencies": {
+    "@zkpassport/sdk": "file:../zkpassport-packages/packages/zkpassport-sdk",
+    "@zkpassport/ui": "file:../zkpassport-packages/packages/zkpassport-ui",
+    "@obsidion/bridge": "^0.12.3",
+    "@aztec-foundation/bb.js": "6.0.0",
+    "@aztec/bb.js": "5.0.0",
+    "@noir-lang/noir_js": "1.0.0-beta.22",
+    "buffer": "^6.0.3",
+    "cors": "^2.8.5",
+    "i18n-iso-countries": "^7.12.0",
+    "dotenv": "^18.0.7",
+    "express": "^5.3.0",
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.23.1",
+    "tslib": "^2.8.1",
+    "viem": "^2.27.2"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/dotenv": "^6.1.1",
+    "@types/express": "^5.0.6",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^26.6.5",
+    "@types/pg": "^8.23.1",
+    "tsx": "^4.7.0",
+    "typescript": "^7.0.2"
+  }
+}

@@ -1,0 +1,908 @@
+import { QueryBuilder, ZKPassport as ZkPassportVerifier, NullifierType } from "../src/index"
+import { MockWebSocket } from "./helpers/mock-websocket"
+
+describe("Query Builder", () => {
+  let zkPassport: ZkPassportVerifier
+  let queryBuilder: QueryBuilder
+  let originalFetch: typeof globalThis.fetch
+
+  beforeEach(async () => {
+    MockWebSocket.clearHub()
+
+    // request() fetches the dashboard config best-effort; stub so tests stay offline.
+    originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response("{}", {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      })) as unknown as typeof globalThis.fetch
+
+    zkPassport = new ZkPassportVerifier("localhost")
+    queryBuilder = await zkPassport.request({
+      name: "Test App",
+      logo: "https://test.com/logo.png",
+      purpose: "Testing query builder",
+    })
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  test("should build equality query with validation", async () => {
+    const result = queryBuilder.eq("document_type", "passport").eq("gender", "female").done()
+
+    expect(result.url).toContain("c=")
+    const configPart = new URL(result.url).searchParams.get("c")!
+    const config = JSON.parse(Buffer.from(configPart, "base64").toString())
+
+    // Test exact structure and values
+    expect(config).toEqual({
+      document_type: { eq: "passport" },
+      gender: { eq: "female" },
+    })
+
+    // Test that no unexpected fields are present
+    expect(Object.keys(config).length).toBe(2)
+  })
+
+  test("should build age comparison query with boundary validation", async () => {
+    const result = queryBuilder.gte("age", 18).lt("age", 65).done()
+
+    const configPart = new URL(result.url).searchParams.get("c")!
+    const config = JSON.parse(Buffer.from(configPart, "base64").toString())
+
+    expect(config.age).toEqual({
+      gte: 18,
+      lt: 65,
+    })
+  })
+
+  test("should build date range query with validation", async () => {
+    const startDate = new Date("2024-01-01")
+    const endDate = new Date("2024-12-31")
+    const result = queryBuilder.range("birthdate", startDate, endDate).done()
+
+    const configPart = new URL(result.url).searchParams.get("c")!
+    const config = JSON.parse(Buffer.from(configPart, "base64").toString())
+
+    expect(config.birthdate.range).toEqual([startDate.toISOString(), endDate.toISOString()])
+  })
+
+  test("should build nationality inclusion/exclusion query with validation", async () => {
+    const result = queryBuilder
+      .in("nationality", ["FRA", "DEU", "ITA"])
+      .out("nationality", ["USA", "GBR"])
+      .done()
+
+    const configPart = new URL(result.url).searchParams.get("c")!
+    const config = JSON.parse(Buffer.from(configPart, "base64").toString())
+
+    expect(config.nationality).toEqual({
+      in: ["FRA", "DEU", "ITA"],
+      out: ["USA", "GBR"],
+    })
+  })
+
+  test("should convert country names to Alpha-3 codes in nationality inclusion/exclusion query", async () => {
+    const result = queryBuilder
+      .in("nationality", ["France", "Germany", "Italy"])
+      .out("nationality", ["United States", "United Kingdom"])
+      .done()
+
+    const configPart = new URL(result.url).searchParams.get("c")!
+    const config = JSON.parse(Buffer.from(configPart, "base64").toString())
+
+    expect(config.nationality).toEqual({
+      in: ["FRA", "DEU", "ITA"],
+      out: ["USA", "GBR"],
+    })
+  })
+
+  test("should build disclosure request with validation", async () => {
+    const result = queryBuilder.disclose("fullname").disclose("birthdate").done()
+
+    const configPart = new URL(result.url).searchParams.get("c")!
+    const config = JSON.parse(Buffer.from(configPart, "base64").toString())
+
+    expect(config).toEqual({
+      fullname: { disclose: true },
+      birthdate: { disclose: true },
+    })
+  })
+
+  test("should combine multiple query types with complete validation", async () => {
+    const startDate = new Date("2024-01-01")
+    const result = queryBuilder
+      .eq("document_type", "passport")
+      .gte("age", 18)
+      .in("nationality", ["FRA", "DEU"])
+      .disclose("fullname")
+      .range("expiry_date", startDate, new Date("2025-01-01"))
+      .done()
+
+    const configPart = new URL(result.url).searchParams.get("c")!
+    const config = JSON.parse(Buffer.from(configPart, "base64").toString())
+
+    // Test complete structure
+    expect(config).toEqual({
+      document_type: { eq: "passport" },
+      age: { gte: 18 },
+      nationality: { in: ["FRA", "DEU"] },
+      fullname: { disclose: true },
+      expiry_date: { range: [startDate.toISOString(), new Date("2025-01-01").toISOString()] },
+    })
+
+    // Verify URL format
+    expect(result.url).toMatch(
+      /^https:\/\/zkpassport\.id\/r\?d=[^&]+&t=[^&]+&c=[A-Za-z0-9%]+&s=[A-Za-z0-9%]+&p=[^&]+&m=[^&]+&v=[^&]+&dt=[^&]+&dev=[^&]+$/,
+    )
+
+    // Verify service info is included
+    const servicePart = new URL(result.url).searchParams.get("s")!
+    const service = JSON.parse(Buffer.from(servicePart, "base64").toString())
+    expect(service).toEqual({
+      name: "Test App",
+      logo: "https://test.com/logo.png",
+      purpose: "Testing query builder",
+    })
+  })
+
+  test("should URL-encode params whose base64 contains reserved characters", async () => {
+    const builder = await zkPassport.request({
+      name: "株式会社テスト",
+      logo: "https://test.jp/logo.png",
+      purpose: "年齢確認",
+    })
+    const result = builder.gte("age", 18).done()
+
+    // A raw "+" in the query string would be decoded as a space and corrupt the base64
+    expect(result.url.split("?")[1]).not.toContain("+")
+
+    const servicePart = new URL(result.url).searchParams.get("s")!
+    const service = JSON.parse(Buffer.from(servicePart, "base64").toString())
+    expect(service.name).toBe("株式会社テスト")
+  })
+
+  test("should handle inclusive bounds for age queries", async () => {
+    const result = queryBuilder.gte("age", 18).lte("age", 25).done()
+
+    const configPart = new URL(result.url).searchParams.get("c")!
+    const config = JSON.parse(Buffer.from(configPart, "base64").toString())
+
+    expect(config.age).toEqual({
+      gte: 18,
+      lte: 25,
+    })
+  })
+
+  test("should handle exclusive bounds for age queries", async () => {
+    const result = queryBuilder.gt("age", 18).lt("age", 25).done()
+
+    const configPart = new URL(result.url).searchParams.get("c")!
+    const config = JSON.parse(Buffer.from(configPart, "base64").toString())
+
+    expect(config.age).toEqual({
+      gt: 18,
+      lt: 25,
+    })
+  })
+
+  test("should handle inclusive bounds for birthdate queries", async () => {
+    const result = queryBuilder
+      .gte("birthdate", new Date("2024-01-01"))
+      .lte("birthdate", new Date("2024-12-31"))
+      .done()
+    const configPart = new URL(result.url).searchParams.get("c")!
+    const config = JSON.parse(Buffer.from(configPart, "base64").toString())
+
+    expect(config.birthdate).toEqual({
+      gte: new Date("2024-01-01").toISOString(),
+      lte: new Date("2024-12-31").toISOString(),
+    })
+  })
+
+  test("should handle exclusive bounds for birthdate queries", async () => {
+    const result = queryBuilder
+      .gt("birthdate", new Date("2024-01-01"))
+      .lt("birthdate", new Date("2024-12-31"))
+      .done()
+    const configPart = new URL(result.url).searchParams.get("c")!
+    const config = JSON.parse(Buffer.from(configPart, "base64").toString())
+
+    expect(config.birthdate).toEqual({
+      gt: new Date("2024-01-01").toISOString(),
+      lt: new Date("2024-12-31").toISOString(),
+    })
+  })
+
+  test("should handle inclusive bounds for expiry_date queries", async () => {
+    const result = queryBuilder
+      .gte("expiry_date", new Date("2024-01-01"))
+      .lte("expiry_date", new Date("2024-12-31"))
+      .done()
+
+    const configPart = new URL(result.url).searchParams.get("c")!
+    const config = JSON.parse(Buffer.from(configPart, "base64").toString())
+
+    expect(config.expiry_date).toEqual({
+      gte: new Date("2024-01-01").toISOString(),
+      lte: new Date("2024-12-31").toISOString(),
+    })
+  })
+
+  test("should handle exclusive bounds for expiry_date queries", async () => {
+    const result = queryBuilder
+      .gt("expiry_date", new Date("2024-01-01"))
+      .lt("expiry_date", new Date("2024-12-31"))
+      .done()
+
+    const configPart = new URL(result.url).searchParams.get("c")!
+    const config = JSON.parse(Buffer.from(configPart, "base64").toString())
+
+    expect(config.expiry_date).toEqual({
+      gt: new Date("2024-01-01").toISOString(),
+      lt: new Date("2024-12-31").toISOString(),
+    })
+  })
+
+  test("should build sanctions query defaulting to all countries and lists", async () => {
+    const result = queryBuilder.sanctions().done()
+
+    const configPart = new URL(result.url).searchParams.get("c")!
+    const config = JSON.parse(Buffer.from(configPart, "base64").toString())
+
+    expect(config.sanctions).toEqual({
+      countries: "all",
+      lists: "all",
+      strict: false,
+    })
+  })
+
+  test("should build sanctions query with strict mode", async () => {
+    const result = queryBuilder
+      .sanctions("all", "all", {
+        strict: true,
+      })
+      .done()
+
+    const configPart = new URL(result.url).searchParams.get("c")!
+    const config = JSON.parse(Buffer.from(configPart, "base64").toString())
+
+    expect(config.sanctions).toEqual({
+      countries: "all",
+      lists: "all",
+      strict: true,
+    })
+  })
+
+  /*test("should build sanctions query for single country", async () => {
+    const result = queryBuilder.sanctions("GB").done()
+
+    const configPart = new URL(result.url).searchParams.get("c")!
+    const config = JSON.parse(Buffer.from(configPart, "base64").toString())
+
+    expect(config.sanctions).toEqual({
+      countries: ["GB"],
+      lists: "all",
+      strict: false,
+    })
+  })
+
+  test("should build sanctions query for single country with custom list", async () => {
+    const result = queryBuilder.sanctions("US", ["OFAC_SDN"]).done()
+
+    const configPart = new URL(result.url).searchParams.get("c")!
+    const config = JSON.parse(Buffer.from(configPart, "base64").toString())
+
+    expect(config.sanctions).toEqual({
+      countries: ["US"],
+      lists: ["OFAC_SDN"],
+      strict: false,
+    })
+  })
+
+  test("should build sanctions query for multiple countries", async () => {
+    const result = queryBuilder.sanctions(["US", "GB", "CH", "EU"]).done()
+
+    const configPart = new URL(result.url).searchParams.get("c")!
+    const config = JSON.parse(Buffer.from(configPart, "base64").toString())
+
+    expect(config.sanctions).toEqual({
+      countries: ["US", "GB", "CH", "EU"],
+      lists: "all",
+      strict: false,
+    })
+  })
+
+  test("should build sanctions query for multiple countries using multiple calls", async () => {
+    const result = queryBuilder
+      .sanctions("US")
+      .sanctions("GB")
+      .sanctions("CH")
+      .sanctions("EU")
+      .done()
+
+    const configPart = new URL(result.url).searchParams.get("c")!
+    const config = JSON.parse(Buffer.from(configPart, "base64").toString())
+
+    expect(config.sanctions).toEqual({
+      countries: ["US", "GB", "CH", "EU"],
+      lists: "all",
+      strict: false,
+    })
+  })*/
+
+  test("should build facematch query with strict mode", async () => {
+    const result = queryBuilder.facematch("strict").done()
+
+    const configPart = new URL(result.url).searchParams.get("c")!
+    const config = JSON.parse(Buffer.from(configPart, "base64").toString())
+
+    expect(config.facematch).toEqual({
+      mode: "strict",
+    })
+  })
+
+  test("should build facematch query with regular mode", async () => {
+    const result = queryBuilder.facematch("regular").done()
+
+    const configPart = new URL(result.url).searchParams.get("c")!
+    const config = JSON.parse(Buffer.from(configPart, "base64").toString())
+
+    expect(config.facematch).toEqual({
+      mode: "regular",
+    })
+  })
+})
+
+describe("createQuery (offline mode)", () => {
+  let zkPassport: ZkPassportVerifier
+
+  beforeEach(() => {
+    zkPassport = new ZkPassportVerifier("localhost")
+  })
+
+  test("done() returns only { query } without url or callbacks", () => {
+    const result = zkPassport.createQuery().eq("nationality", "FRA").done()
+
+    expect(result.query).toBeDefined()
+    // Should NOT have online-mode properties
+    expect((result as Record<string, unknown>).url).toBeUndefined()
+    expect((result as Record<string, unknown>).requestId).toBeUndefined()
+    expect((result as Record<string, unknown>).onResult).toBeUndefined()
+    expect((result as Record<string, unknown>).onReject).toBeUndefined()
+    expect((result as Record<string, unknown>).onError).toBeUndefined()
+    expect((result as Record<string, unknown>).onBridgeConnect).toBeUndefined()
+    expect((result as Record<string, unknown>).onBridgeConnectionLost).toBeUndefined()
+    expect((result as Record<string, unknown>).onRequestReceived).toBeUndefined()
+    expect((result as Record<string, unknown>).onGeneratingProof).toBeUndefined()
+    expect((result as Record<string, unknown>).onProofGenerated).toBeUndefined()
+    expect((result as Record<string, unknown>).isBridgeConnected).toBeUndefined()
+    expect((result as Record<string, unknown>).requestReceived).toBeUndefined()
+  })
+
+  test("should build equality query", () => {
+    const result = zkPassport
+      .createQuery()
+      .eq("document_type", "passport")
+      .eq("gender", "female")
+      .done()
+
+    expect(result.query).toEqual({
+      document_type: { eq: "passport" },
+      gender: { eq: "female" },
+    })
+  })
+
+  test("should build age comparison query", () => {
+    const result = zkPassport.createQuery().gte("age", 18).lt("age", 65).done()
+
+    expect(result.query.age).toEqual({
+      gte: 18,
+      lt: 65,
+    })
+  })
+
+  test("should build disclosure request", () => {
+    const result = zkPassport.createQuery().disclose("fullname").disclose("birthdate").done()
+
+    expect(result.query).toEqual({
+      fullname: { disclose: true },
+      birthdate: { disclose: true },
+    })
+  })
+
+  test("should build nationality inclusion/exclusion query", () => {
+    const result = zkPassport
+      .createQuery()
+      .in("nationality", ["FRA", "DEU"])
+      .out("issuing_country", ["USA"])
+      .done()
+
+    expect(result.query.nationality).toEqual({ in: ["FRA", "DEU"] })
+    expect(result.query.issuing_country).toEqual({ out: ["USA"] })
+  })
+
+  test("should build combined query", () => {
+    const result = zkPassport
+      .createQuery()
+      .eq("document_type", "passport")
+      .gte("age", 18)
+      .disclose("fullname")
+      .in("nationality", ["FRA", "DEU"])
+      .sanctions()
+      .done()
+
+    expect(result.query).toEqual({
+      document_type: { eq: "passport" },
+      age: { gte: 18 },
+      fullname: { disclose: true },
+      nationality: { in: ["FRA", "DEU"] },
+      sanctions: { countries: "all", lists: "all", strict: false },
+    })
+  })
+
+  test("should build sanctions query with strict mode", () => {
+    const result = zkPassport.createQuery().sanctions("all", "all", { strict: true }).done()
+
+    expect(result.query.sanctions).toEqual({
+      countries: "all",
+      lists: "all",
+      strict: true,
+    })
+  })
+
+  test("should build bind query", () => {
+    const result = zkPassport
+      .createQuery()
+      .bind("user_address", "0x1234abcd")
+      .bind("chain", "ethereum")
+      .done()
+
+    expect(result.query.bind).toEqual({
+      user_address: "0x1234abcd",
+      chain: "ethereum",
+    })
+  })
+
+  test("should build facematch query", () => {
+    const result = zkPassport.createQuery().facematch("strict").done()
+
+    expect(result.query.facematch).toEqual({ mode: "strict" })
+  })
+})
+
+describe("Policy-driven requests", () => {
+  let zkPassport: ZkPassportVerifier
+  let originalFetch: typeof globalThis.fetch
+  let lastFetchUrl: string | undefined
+  let fetchCount: number
+
+  const sampleConfig = {
+    project: {
+      name: "Dashboard Brand",
+      domain: "localhost",
+      logoUrl: "https://dashboard.example/logo.png",
+      allowedOrigins: [],
+    },
+    policies: [
+      {
+        id: "pol_xyz",
+        version: 3,
+        name: "Age + nationality",
+        purpose: "Policy purpose",
+        projectId: null,
+        query: {
+          age: { gte: 18 },
+          firstname: { disclose: true },
+          nationality: { in: ["FRA", "DEU"] },
+        },
+      },
+      {
+        id: "pol_other",
+        version: 1,
+        name: "Adults only",
+        purpose: "",
+        projectId: null,
+        query: { age: { gte: 21 } },
+      },
+    ],
+  }
+
+  function mockFetchReturning(body: object, status = 200) {
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      lastFetchUrl = typeof input === "string" ? input : input.toString()
+      fetchCount++
+      return new Response(JSON.stringify(body), {
+        status,
+        statusText: status === 404 ? "Not Found" : "OK",
+        headers: { "Content-Type": "application/json" },
+      })
+    }) as unknown as typeof globalThis.fetch
+  }
+
+  beforeEach(() => {
+    MockWebSocket.clearHub()
+    zkPassport = new ZkPassportVerifier("localhost")
+    originalFetch = globalThis.fetch
+    lastFetchUrl = undefined
+    fetchCount = 0
+    mockFetchReturning(sampleConfig)
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  test("fetches the per-domain config and uses the policy + branding", async () => {
+    const queryBuilder = (await zkPassport.request({})).policy("pol_xyz")
+    const result = queryBuilder.done()
+
+    expect(lastFetchUrl).toBe("https://dashboard-api.zkpassport.id/public/project?domain=localhost")
+    expect(result.policy).toBe("pol_xyz")
+    expect(result.query).toEqual(sampleConfig.policies[0].query)
+
+    const servicePart = new URL(result.url).searchParams.get("s")!
+    const service = JSON.parse(Buffer.from(servicePart, "base64").toString())
+    expect(service).toMatchObject({
+      name: "Dashboard Brand",
+      logo: "https://dashboard.example/logo.png",
+      purpose: "Policy purpose",
+      scope: "pol_xyz",
+    })
+  })
+
+  test("dashboard config is cached per instance: multiple requests trigger one fetch", async () => {
+    ;(await zkPassport.request({})).policy("pol_xyz")
+    ;(await zkPassport.request({})).policy("pol_other")
+    ;(await zkPassport.request({})).policy("pol_xyz")
+    expect(fetchCount).toBe(1)
+  })
+
+  test("per-request name/logo override dashboard branding (white-label)", async () => {
+    const queryBuilder = (
+      await zkPassport.request({
+        name: "White Label",
+        logo: "https://white.example/logo.png",
+      })
+    ).policy("pol_xyz")
+    const result = queryBuilder.done()
+
+    const servicePart = new URL(result.url).searchParams.get("s")!
+    const service = JSON.parse(Buffer.from(servicePart, "base64").toString())
+    expect(service.name).toBe("White Label")
+    expect(service.logo).toBe("https://white.example/logo.png")
+    // purpose/scope still come from the policy
+    expect(service.purpose).toBe("Policy purpose")
+    expect(service.scope).toBe("pol_xyz")
+  })
+
+  test("caller's purpose and scope win over the policy", async () => {
+    const queryBuilder = (
+      await zkPassport.request({
+        purpose: "Caller-supplied purpose",
+        scope: "caller-supplied-scope",
+      })
+    ).policy("pol_xyz")
+    const result = queryBuilder.done()
+
+    const servicePart = new URL(result.url).searchParams.get("s")!
+    const service = JSON.parse(Buffer.from(servicePart, "base64").toString())
+    expect(service.purpose).toBe("Caller-supplied purpose")
+    expect(service.scope).toBe("caller-supplied-scope")
+  })
+
+  test("the service names the policy even when the caller supplies its own scope", async () => {
+    const result = (await zkPassport.request({ scope: "caller-supplied-scope" }))
+      .policy("pol_xyz")
+      .done()
+
+    const servicePart = new URL(result.url).searchParams.get("s")!
+    const service = JSON.parse(Buffer.from(servicePart, "base64").toString())
+    expect(service.policyId).toBe("pol_xyz")
+  })
+
+  test("self-serve callers get sensible defaults when no fields are supplied", async () => {
+    const queryBuilder = await zkPassport.request({})
+    const result = queryBuilder.done()
+    const servicePart = new URL(result.url).searchParams.get("s")!
+    const service = JSON.parse(Buffer.from(servicePart, "base64").toString())
+    // name/logo come from the dashboard config when registered; purpose falls to a default;
+    // scope stays undefined unless the caller (or a policy) supplies one.
+    expect(service.name).toBe("Dashboard Brand")
+    expect(service.logo).toBe("https://dashboard.example/logo.png")
+    expect(service.purpose).toBe("Verify identity privately")
+    expect(service.scope).toBeUndefined()
+  })
+
+  test(".policy() throws a clear 'domain not registered' error when the dashboard returns a null project", async () => {
+    mockFetchReturning({ project: null, policies: [] })
+    const builder = await zkPassport.request({})
+    expect(() => builder.policy("pol_xyz")).toThrow(
+      /localhost is not set up for ZKPassport verification/i,
+    )
+  })
+
+  test("the 'not registered' answer is cached: multiple requests trigger one fetch", async () => {
+    mockFetchReturning({ project: null, policies: [] })
+    await zkPassport.request({})
+    await zkPassport.request({})
+    expect(fetchCount).toBe(1)
+  })
+
+  test(".policy() throws when the requested policy id is not in the dashboard's policies array", async () => {
+    const builder = await zkPassport.request({})
+    expect(() => builder.policy("pol_missing")).toThrow(
+      /Policy 'pol_missing' not found for domain 'localhost'/,
+    )
+  })
+
+  test(".policy() throws when called after a builder method", async () => {
+    // No branding here — otherwise the branding check could mask the
+    // query-mutation check we're trying to test.
+    const builder = await zkPassport.request({})
+    builder.gte("age", 18)
+    expect(() => builder.policy("pol_xyz")).toThrow(/Cannot combine \.policy\(\)/i)
+  })
+
+  test(".policy() throws when called more than once", async () => {
+    const builder = (await zkPassport.request({})).policy("pol_xyz")
+    expect(() => builder.policy("pol_xyz")).toThrow(/more than once/i)
+  })
+
+  test("every mutating builder method except .bind() throws after .policy()", async () => {
+    const builder = (await zkPassport.request({})).policy("pol_xyz")
+    expect(() => builder.eq("document_type", "passport")).toThrow(/policy-driven/i)
+    expect(() => builder.disclose("firstname")).toThrow(/policy-driven/i)
+    expect(() => builder.sanctions()).toThrow(/policy-driven/i)
+    expect(() => builder.bind("chain", "ethereum")).not.toThrow()
+  })
+
+  test(".bind() after .policy() adds bound data on top of the policy query", async () => {
+    const result = (await zkPassport.request({}))
+      .policy("pol_xyz")
+      .bind("user_address", "0x1234abcd")
+      .bind("chain", "ethereum")
+      .done()
+
+    expect(result.policy).toBe("pol_xyz")
+    expect(result.query).toEqual({
+      ...sampleConfig.policies[0].query,
+      bind: { user_address: "0x1234abcd", chain: "ethereum" },
+    })
+  })
+
+  test(".bind() before .policy() still throws", async () => {
+    const builder = await zkPassport.request({})
+    builder.bind("user_address", "0x1234abcd")
+    expect(() => builder.policy("pol_xyz")).toThrow(/Cannot combine \.policy\(\)/i)
+  })
+
+  test(".bind() on one policy-driven request does not leak into the next", async () => {
+    ;(await zkPassport.request({})).policy("pol_xyz").bind("chain", "ethereum")
+    const result = (await zkPassport.request({})).policy("pol_xyz").done()
+    expect(result.query.bind).toBeUndefined()
+  })
+
+  test(".policy() rejects an empty id", async () => {
+    const builder = await zkPassport.request({})
+    expect(() => builder.policy("")).toThrow(/non-empty string/)
+  })
+
+  test("policy with empty branding falls back to defaults (domain / generic purpose)", async () => {
+    mockFetchReturning({
+      project: { name: "", domain: "localhost", logoUrl: null, allowedOrigins: [] },
+      policies: [
+        {
+          id: "pol_blank",
+          version: 1,
+          name: "blank",
+          purpose: "",
+          projectId: null,
+          query: { age: { gte: 18 } },
+        },
+      ],
+    })
+
+    const queryBuilder = (await zkPassport.request({})).policy("pol_blank")
+    const result = queryBuilder.done()
+    const servicePart = new URL(result.url).searchParams.get("s")!
+    const service = JSON.parse(Buffer.from(servicePart, "base64").toString())
+    expect(service.name).toBe("localhost")
+    expect(service.logo).toBe("")
+    expect(service.purpose).toBe("Verify identity privately")
+    expect(service.scope).toBe("pol_blank")
+  })
+
+  test("self-serve callers benefit from dashboard branding when the domain is registered", async () => {
+    // No name/logo passed; the dashboard branding fills them in. (Purpose still
+    // comes from the caller — there's no domain-level default purpose.)
+    const queryBuilder = await zkPassport.request({ purpose: "Custom purpose" })
+    const result = queryBuilder.done()
+
+    const servicePart = new URL(result.url).searchParams.get("s")!
+    const service = JSON.parse(Buffer.from(servicePart, "base64").toString())
+    expect(service.name).toBe("Dashboard Brand")
+    expect(service.logo).toBe("https://dashboard.example/logo.png")
+    expect(service.purpose).toBe("Custom purpose")
+    expect(result.policy).toBeUndefined()
+    expect(fetchCount).toBe(1)
+  })
+
+  test("self-serve tolerates a failing dashboard fetch silently", async () => {
+    mockFetchReturning({}, 404)
+    const queryBuilder = await zkPassport.request({
+      name: "Self",
+      logo: "https://e/l.png",
+      purpose: "p",
+    })
+    expect(() => queryBuilder.done()).not.toThrow()
+  })
+
+  test("a failed fetch is retried on the next request() call", async () => {
+    // First request fails — the cached promise must be cleared on failure
+    // so the next request() retries instead of replaying the error.
+    globalThis.fetch = (async () => {
+      throw new TypeError("network down")
+    }) as unknown as typeof globalThis.fetch
+    await zkPassport.request({ name: "Self", logo: "https://e/l.png", purpose: "p" })
+
+    mockFetchReturning(sampleConfig)
+    const builder = await zkPassport.request({})
+    const result = builder.policy("pol_xyz").done()
+    expect(result.policy).toBe("pol_xyz")
+  })
+})
+
+describe("Salted nullifier facematch validation", () => {
+  let zkPassport: ZkPassportVerifier
+  let originalFetch: typeof globalThis.fetch
+
+  const SALTED_ERROR = "Salted nullifier requires strict facematch"
+
+  beforeEach(() => {
+    MockWebSocket.clearHub()
+    originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response("{}", {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      })) as unknown as typeof globalThis.fetch
+    zkPassport = new ZkPassportVerifier("localhost")
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  // Build a salted-nullifier query builder, optionally in dev mode.
+  const saltedBuilder = (devMode?: boolean) =>
+    zkPassport.request({
+      name: "Test App",
+      logo: "https://test.com/logo.png",
+      purpose: "Testing salted validation",
+      uniqueIdentifierType: NullifierType.SALTED,
+      devMode,
+    })
+
+  test("salted + non-dev + strict facematch: allowed", async () => {
+    const qb = await saltedBuilder(false)
+    expect(() => qb.facematch("strict").done()).not.toThrow()
+  })
+
+  test("salted + non-dev + regular facematch: rejected (must be strict)", async () => {
+    const qb = await saltedBuilder(false)
+    expect(() => qb.facematch("regular").done()).toThrow(SALTED_ERROR)
+  })
+
+  test("salted + non-dev + no facematch: rejected", async () => {
+    const qb = await saltedBuilder(false)
+    expect(() => qb.done()).toThrow(SALTED_ERROR)
+  })
+
+  test("salted with devMode unset defaults to non-dev (regular facematch rejected)", async () => {
+    const qb = await saltedBuilder()
+    expect(() => qb.facematch("regular").done()).toThrow(SALTED_ERROR)
+  })
+
+  test("salted + dev + strict facematch: allowed", async () => {
+    const qb = await saltedBuilder(true)
+    expect(() => qb.facematch("strict").done()).not.toThrow()
+  })
+
+  test("salted + dev + regular facematch: allowed", async () => {
+    const qb = await saltedBuilder(true)
+    expect(() => qb.facematch("regular").done()).not.toThrow()
+  })
+
+  test("salted + dev + no facematch: rejected (facematch always required)", async () => {
+    const qb = await saltedBuilder(true)
+    expect(() => qb.done()).toThrow(SALTED_ERROR)
+  })
+
+  test("non-salted + no facematch: allowed", async () => {
+    const qb = await zkPassport.request({
+      name: "Test App",
+      logo: "https://test.com/logo.png",
+      purpose: "Testing salted validation",
+      uniqueIdentifierType: NullifierType.NON_SALTED,
+    })
+    expect(() => qb.done()).not.toThrow()
+  })
+
+  test("encodes nt=0 in the request URL", async () => {
+    const qb = await zkPassport.request({
+      name: "Test App",
+      logo: "https://test.com/logo.png",
+      purpose: "Testing salted validation",
+      uniqueIdentifierType: NullifierType.NON_SALTED,
+    })
+    const result = qb.disclose("firstname").done()
+    expect(result.url).toContain(`&nt=${NullifierType.NON_SALTED}`)
+  })
+
+  test("omits nt from the URL when uniqueIdentifierType is null", async () => {
+    const qb = await zkPassport.request({
+      name: "Test App",
+      logo: "https://test.com/logo.png",
+      purpose: "Testing salted validation",
+      uniqueIdentifierType: null as any, // eslint-disable-line @typescript-eslint/no-explicit-any
+    })
+    const result = qb.disclose("firstname").done()
+    expect(result.url).not.toContain("&nt=")
+  })
+})
+
+describe("NONE nullifier type requests", () => {
+  let zkPassport: ZkPassportVerifier
+  let originalFetch: typeof globalThis.fetch
+
+  beforeEach(() => {
+    MockWebSocket.clearHub()
+    originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response("{}", {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      })) as unknown as typeof globalThis.fetch
+    zkPassport = new ZkPassportVerifier("localhost")
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  const noneRequest = (extra?: { oprfKeyId?: string }) =>
+    zkPassport.request({
+      name: "Test App",
+      logo: "https://test.com/logo.png",
+      purpose: "Testing NONE nullifier type",
+      uniqueIdentifierType: NullifierType.NONE,
+      ...extra,
+    })
+
+  test("encodes nt=4 in the request URL", async () => {
+    const qb = await noneRequest()
+    const result = qb.disclose("firstname").done()
+    expect(result.url).toContain(`&nt=${NullifierType.NONE}`)
+  })
+
+  test("NONE with a plain disclosure is allowed", async () => {
+    const qb = await noneRequest()
+    expect(() => qb.disclose("firstname").done()).not.toThrow()
+  })
+
+  test("NONE with facematch is allowed", async () => {
+    const strictQb = await noneRequest()
+    expect(() => strictQb.facematch("strict").done()).not.toThrow()
+    const regularQb = await noneRequest()
+    expect(() => regularQb.facematch("regular").done()).not.toThrow()
+  })
+
+  test("rejects an OPRF key combined with NONE", async () => {
+    await expect(noneRequest({ oprfKeyId: "some-oprf-key" })).rejects.toThrow(
+      "An OPRF key cannot be used with the NONE unique identifier type",
+    )
+  })
+})

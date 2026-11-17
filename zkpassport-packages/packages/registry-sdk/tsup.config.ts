@@ -1,0 +1,25 @@
+import { defineConfig } from "tsup"
+
+const isDev = process.env.DEV_BUILD === "true"
+
+export default defineConfig(
+  (["esm", "cjs"] as const).map((format) => ({
+    entry: ["src/index.ts", "src/mock-client.ts"],
+    dts: {
+      compilerOptions: {
+        composite: false,
+      },
+    },
+    clean: true,
+    format,
+    outDir: `dist/${format}`,
+    outExtension: () => ({ js: format === "cjs" ? ".cjs" : ".js" }),
+    splitting: false,
+    sourcemap: true,
+    treeshake: !isDev,
+    minify: !isDev,
+    // For release builds, externalize workspace deps so outputs stay modular
+    // For dev builds, inline them for instant edits
+    ...(isDev ? { noExternal: [/@zkpassport\/.*/] } : { external: ["@zkpassport/utils"] }),
+  })),
+)

@@ -1,0 +1,11 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/zkpassport-utils" },
+    { "path": "./packages/registry-sdk" },
+    { "path": "./packages/zkpassport-sdk" },
+    { "path": "./packages/onchain-credentials/javascript" },
+    { "path": "./packages/registry-explorer" }
+  ],
+  "include": [".eslintrc.cjs"]
+}

@@ -1,0 +1,3853 @@
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test"
+import { PublicInputChecker } from "../src/public-input-checker"
+import type {
+  Query,
+  QueryResult,
+  ProofResult,
+  DiscloseCommittedInputs,
+  FacematchCommittedInputs,
+  SupportedChain,
+} from "@zkpassport/utils"
+import {
+  SECONDS_BETWEEN_1900_AND_1970,
+  getIdFromChain,
+  getServiceScopeHash,
+  getScopeHash,
+  getAgeParameterCommitment,
+  getDiscloseParameterCommitment,
+  getDisclosedBytesFromMrzAndMask,
+  getSanctionsParameterCommitment,
+  hashOprfPublicKey,
+  NullifierType,
+} from "@zkpassport/utils"
+import {
+  APPLE_APP_ATTEST_ROOT_KEY_HASH,
+  GOOGLE_APP_ATTEST_RSA_ROOT_KEY_HASH,
+  ZKPASSPORT_IOS_APP_ID_HASH,
+  ZKPASSPORT_ANDROID_APP_ID_HASH,
+} from "../src/constants"
+import { RegistryClient } from "@zkpassport/registry"
+
+// A sanctions root the mocked registry reports as valid
+const VALID_SANCTIONS_ROOT = "0x" + "ab".repeat(32)
+
+function mockSanctionsRootValidity() {
+  return spyOn(RegistryClient.prototype, "isSanctionsRootValid").mockImplementation(
+    async (root: string) => root === VALID_SANCTIONS_ROOT,
+  )
+}
+
+// Helper to build a minimal disclose proof with committed inputs
+function makeDiscloseProof(disclosedBytes: number[]): ProofResult {
+  return {
+    name: "disclose_bytes",
+    proof: "",
+    total: 1,
+    committedInputs: {
+      disclose_bytes: {
+        discloseMask: disclosedBytes.map((b) => (b !== 0 ? 1 : 0)),
+        disclosedBytes,
+      } as DiscloseCommittedInputs,
+    },
+  }
+}
+
+// Helper to build a minimal age proof with committed inputs
+function makeAgeProof(minAge: number, maxAge: number): ProofResult {
+  return {
+    name: "compare_age",
+    proof: "",
+    total: 1,
+    committedInputs: {
+      compare_age: { minAge, maxAge },
+    },
+  }
+}
+
+// Helper to check that no error with "original query" is present in a field
+function hasOriginalQueryError(
+  errors: Record<string, unknown> | undefined,
+  field: string,
+): boolean {
+  if (!errors) return false
+  const err = errors[field]
+  if (!err) return false
+  return (
+    typeof (err as { message: string }).message === "string" &&
+    (err as { message: string }).message.includes("original query")
+  )
+}
+
+describe("PublicInputChecker - originalQuery validation", () => {
+  describe("checkDiscloseBytesPublicInputs", () => {
+    // We use zeroed disclosed bytes so disclosed data won't match queryResult expected values.
+    // The tests focus on originalQuery checks which run independently of disclosed data checks.
+    const emptyProof = makeDiscloseProof(new Array(90).fill(0))
+
+    describe("nationality eq", () => {
+      test("no originalQuery error when queryResult matches originalQuery", () => {
+        const originalQuery: Query = { nationality: { eq: "FRA" } }
+        const queryResult: QueryResult = {
+          nationality: { eq: { expected: "FRA", result: true } },
+        }
+        const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+          emptyProof,
+          originalQuery,
+          queryResult,
+        )
+        // The existing disclosed-data check may set an eq error, but it shouldn't be the originalQuery one
+        expect(hasOriginalQueryError(queryResultErrors.nationality, "eq")).toBe(false)
+      })
+
+      test("fails when queryResult eq expected differs from originalQuery", () => {
+        const originalQuery: Query = { nationality: { eq: "FRA" } }
+        const queryResult: QueryResult = {
+          nationality: { eq: { expected: "DEU", result: true } },
+        }
+        const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+          emptyProof,
+          originalQuery,
+          queryResult,
+        )
+        expect(hasOriginalQueryError(queryResultErrors.nationality, "eq")).toBe(true)
+      })
+
+      test("fails when queryResult has eq but originalQuery does not", () => {
+        const originalQuery: Query = { nationality: { disclose: true } }
+        const queryResult: QueryResult = {
+          nationality: { eq: { expected: "FRA", result: true } },
+        }
+        const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+          emptyProof,
+          originalQuery,
+          queryResult,
+        )
+        expect(hasOriginalQueryError(queryResultErrors.nationality, "eq")).toBe(true)
+      })
+    })
+
+    describe("nationality disclose", () => {
+      test("fails when queryResult has disclose but originalQuery does not", () => {
+        const originalQuery: Query = { nationality: { eq: "FRA" } }
+        const queryResult: QueryResult = {
+          nationality: { disclose: { result: "FRA" } },
+        }
+        const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+          emptyProof,
+          originalQuery,
+          queryResult,
+        )
+        expect(hasOriginalQueryError(queryResultErrors.nationality, "disclose")).toBe(true)
+      })
+
+      test("no originalQuery disclose error when originalQuery requests it", () => {
+        const originalQuery: Query = { nationality: { disclose: true } }
+        const queryResult: QueryResult = {
+          nationality: { disclose: { result: "FRA" } },
+        }
+        const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+          emptyProof,
+          originalQuery,
+          queryResult,
+        )
+        expect(hasOriginalQueryError(queryResultErrors.nationality, "disclose")).toBe(false)
+      })
+    })
+
+    describe("gender eq", () => {
+      test("fails when queryResult gender eq differs from originalQuery", () => {
+        const originalQuery: Query = { gender: { eq: "female" } }
+        const queryResult: QueryResult = {
+          gender: { eq: { expected: "male", result: true } },
+        }
+        const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+          emptyProof,
+          originalQuery,
+          queryResult,
+        )
+        expect(hasOriginalQueryError(queryResultErrors.gender, "eq")).toBe(true)
+      })
+
+      test("no originalQuery error when gender eq matches", () => {
+        const originalQuery: Query = { gender: { eq: "male" } }
+        const queryResult: QueryResult = {
+          gender: { eq: { expected: "male", result: true } },
+        }
+        const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+          emptyProof,
+          originalQuery,
+          queryResult,
+        )
+        expect(hasOriginalQueryError(queryResultErrors.gender, "eq")).toBe(false)
+      })
+    })
+
+    describe("issuing_country eq", () => {
+      test("fails when queryResult issuing_country eq differs from originalQuery", () => {
+        const originalQuery: Query = { issuing_country: { eq: "FRA" } }
+        const queryResult: QueryResult = {
+          issuing_country: { eq: { expected: "DEU", result: false } },
+        }
+        const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+          emptyProof,
+          originalQuery,
+          queryResult,
+        )
+        expect(hasOriginalQueryError(queryResultErrors.issuing_country, "eq")).toBe(true)
+      })
+    })
+
+    describe("document_number eq", () => {
+      test("fails when queryResult document_number eq not in originalQuery", () => {
+        const originalQuery: Query = {}
+        const queryResult: QueryResult = {
+          document_number: { eq: { expected: "ABC123", result: true } },
+        }
+        const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+          emptyProof,
+          originalQuery,
+          queryResult,
+        )
+        expect(hasOriginalQueryError(queryResultErrors.document_number, "eq")).toBe(true)
+      })
+    })
+
+    describe("fullname eq", () => {
+      test("no originalQuery error when names match case-insensitively", () => {
+        const originalQuery: Query = { fullname: { eq: "JOHN DOE" } }
+        const queryResult: QueryResult = {
+          fullname: { eq: { expected: "john doe", result: true } },
+        }
+        const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+          emptyProof,
+          originalQuery,
+          queryResult,
+        )
+        expect(hasOriginalQueryError(queryResultErrors.fullname, "eq")).toBe(false)
+      })
+
+      test("fails when names differ", () => {
+        const originalQuery: Query = { fullname: { eq: "JOHN DOE" } }
+        const queryResult: QueryResult = {
+          fullname: { eq: { expected: "JANE DOE", result: true } },
+        }
+        const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+          emptyProof,
+          originalQuery,
+          queryResult,
+        )
+        expect(hasOriginalQueryError(queryResultErrors.fullname, "eq")).toBe(true)
+      })
+    })
+
+    describe("firstname eq", () => {
+      test("fails when firstname differs from originalQuery", () => {
+        const originalQuery: Query = { firstname: { eq: "JOHN" } }
+        const queryResult: QueryResult = {
+          firstname: { eq: { expected: "JANE", result: true } },
+        }
+        const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+          emptyProof,
+          originalQuery,
+          queryResult,
+        )
+        expect(hasOriginalQueryError(queryResultErrors.firstname, "eq")).toBe(true)
+      })
+    })
+
+    describe("lastname eq", () => {
+      test("fails when lastname not in originalQuery", () => {
+        const originalQuery: Query = {}
+        const queryResult: QueryResult = {
+          lastname: { eq: { expected: "DOE", result: true } },
+        }
+        const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+          emptyProof,
+          originalQuery,
+          queryResult,
+        )
+        expect(hasOriginalQueryError(queryResultErrors.lastname, "eq")).toBe(true)
+      })
+    })
+
+    describe("document_type eq", () => {
+      test("fails when document_type eq not in originalQuery", () => {
+        const originalQuery: Query = {}
+        const queryResult: QueryResult = {
+          document_type: { eq: { expected: "passport", result: true } },
+        }
+        const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+          emptyProof,
+          originalQuery,
+          queryResult,
+        )
+        expect(hasOriginalQueryError(queryResultErrors.document_type, "eq")).toBe(true)
+      })
+
+      test("no originalQuery error when document_type eq matches", () => {
+        const originalQuery: Query = { document_type: { eq: "passport" } }
+        const queryResult: QueryResult = {
+          document_type: { eq: { expected: "passport", result: true } },
+        }
+        const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+          emptyProof,
+          originalQuery,
+          queryResult,
+        )
+        expect(hasOriginalQueryError(queryResultErrors.document_type, "eq")).toBe(false)
+      })
+    })
+
+    describe("name sourced from MRZ", () => {
+      // John Miller Smith's MRZ; reveal the firstname + lastname region "SMITH<<JOHN".
+      const johnMRZ =
+        "P<ZKRSMITH<<JOHN<MILLER<<<<<<<<<<<<<<<<<<<<<ZP1111111_ZKR951112_M350101_<<<<<<<<<<<<<<<<"
+      const nameMask = new Array(90).fill(0)
+      nameMask.fill(1, 5, 16)
+      const proof = makeDiscloseProof(getDisclosedBytesFromMrzAndMask(johnMRZ, nameMask))
+      const originalQuery: Query = {
+        firstname: { disclose: true },
+        lastname: { disclose: true },
+      }
+
+      test("fails when lastname is the DG11 full name instead of the MRZ surname", () => {
+        const queryResult: QueryResult = {
+          firstname: { disclose: { result: "John" } },
+          lastname: { disclose: { result: "John Miller Smith" } },
+        }
+        const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+          proof,
+          originalQuery,
+          queryResult,
+        )
+        expect(queryResultErrors.lastname?.disclose).toBeDefined()
+      })
+
+      test("passes when firstname/lastname are sourced from the MRZ", () => {
+        const queryResult: QueryResult = {
+          firstname: { disclose: { result: "John" } },
+          lastname: { disclose: { result: "Smith" } },
+        }
+        const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+          proof,
+          originalQuery,
+          queryResult,
+        )
+        expect(queryResultErrors.firstname?.disclose).toBeUndefined()
+        expect(queryResultErrors.lastname?.disclose).toBeUndefined()
+      })
+    })
+  })
+
+  describe("checkAgePublicInputs", () => {
+    test("no originalQuery error when gte matches", () => {
+      const proof = makeAgeProof(18, 0)
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.age, "gte")).toBe(false)
+    })
+
+    test("fails when gte expected differs from originalQuery", () => {
+      const proof = makeAgeProof(13, 0)
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 13, result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.age, "gte")).toBe(true)
+    })
+
+    test("fails when gte not in originalQuery", () => {
+      const proof = makeAgeProof(18, 0)
+      const originalQuery: Query = { age: { lt: 65 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.age, "gte")).toBe(true)
+    })
+
+    test("fails when gt expected differs from originalQuery", () => {
+      const proof = makeAgeProof(17, 0)
+      const originalQuery: Query = { age: { gt: 18 } }
+      const queryResult: QueryResult = {
+        age: { gt: { expected: 17, result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.age, "gt")).toBe(true)
+    })
+
+    test("fails when lt expected differs from originalQuery", () => {
+      const proof = makeAgeProof(0, 70)
+      const originalQuery: Query = { age: { lt: 65 } }
+      const queryResult: QueryResult = {
+        age: { lt: { expected: 70, result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.age, "lt")).toBe(true)
+    })
+
+    test("fails when lte expected differs from originalQuery", () => {
+      const proof = makeAgeProof(0, 30)
+      const originalQuery: Query = { age: { lte: 25 } }
+      const queryResult: QueryResult = {
+        age: { lte: { expected: 30, result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.age, "lte")).toBe(true)
+    })
+
+    test("fails when eq expected differs from originalQuery", () => {
+      const proof = makeAgeProof(25, 25)
+      const originalQuery: Query = { age: { eq: 30 } }
+      const queryResult: QueryResult = {
+        age: { eq: { expected: 25, result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.age, "eq")).toBe(true)
+    })
+
+    test("fails when range expected differs from originalQuery", () => {
+      const proof = makeAgeProof(13, 70)
+      const originalQuery: Query = { age: { range: [18, 65] } }
+      const queryResult: QueryResult = {
+        age: { range: { expected: [13, 70], result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.age, "range")).toBe(true)
+    })
+
+    test("fails when disclose not in originalQuery", () => {
+      const proof = makeAgeProof(25, 25)
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { disclose: { result: 25 } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.age, "disclose")).toBe(true)
+    })
+  })
+
+  describe("checkBirthdatePublicInputs", () => {
+    function makeBirthdateProof(minTimestamp: number, maxTimestamp: number): ProofResult {
+      return {
+        name: "compare_birthdate",
+        proof: "",
+        total: 1,
+        committedInputs: {
+          compare_birthdate: { minDateTimestamp: minTimestamp, maxDateTimestamp: maxTimestamp },
+        },
+      }
+    }
+
+    test("fails when gte expected differs from originalQuery", () => {
+      const proof = makeBirthdateProof(0, 0)
+      const originalQuery: Query = { birthdate: { gte: new Date("2000-01-01") } }
+      const queryResult: QueryResult = {
+        birthdate: { gte: { expected: new Date("1990-01-01"), result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkBirthdatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.birthdate, "gte")).toBe(true)
+    })
+
+    test("no originalQuery error when gte matches", () => {
+      const proof = makeBirthdateProof(0, 0)
+      const originalQuery: Query = { birthdate: { gte: new Date("2000-01-01") } }
+      const queryResult: QueryResult = {
+        birthdate: { gte: { expected: new Date("2000-01-01"), result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkBirthdatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.birthdate, "gte")).toBe(false)
+    })
+
+    test("fails when gt not in originalQuery", () => {
+      const proof = makeBirthdateProof(0, 0)
+      const originalQuery: Query = { birthdate: { gte: new Date("2000-01-01") } }
+      const queryResult: QueryResult = {
+        birthdate: { gt: { expected: new Date("2000-01-01"), result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkBirthdatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.birthdate, "gt")).toBe(true)
+    })
+
+    test("fails when lt not in originalQuery", () => {
+      const proof = makeBirthdateProof(0, 0)
+      const originalQuery: Query = { birthdate: { lte: new Date("2000-01-01") } }
+      const queryResult: QueryResult = {
+        birthdate: { lt: { expected: new Date("2000-01-01"), result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkBirthdatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.birthdate, "lt")).toBe(true)
+    })
+
+    test("fails when lte expected differs from originalQuery", () => {
+      const proof = makeBirthdateProof(0, 0)
+      const originalQuery: Query = { birthdate: { lte: new Date("2005-01-01") } }
+      const queryResult: QueryResult = {
+        birthdate: { lte: { expected: new Date("2010-01-01"), result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkBirthdatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.birthdate, "lte")).toBe(true)
+    })
+
+    test("fails when range differs from originalQuery", () => {
+      const proof = makeBirthdateProof(0, 0)
+      const originalQuery: Query = {
+        birthdate: { range: [new Date("2000-01-01"), new Date("2005-01-01")] },
+      }
+      const queryResult: QueryResult = {
+        birthdate: {
+          range: { expected: [new Date("1990-01-01"), new Date("2005-01-01")], result: true },
+        },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkBirthdatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.birthdate, "range")).toBe(true)
+    })
+  })
+
+  describe("checkExpiryDatePublicInputs", () => {
+    function makeExpiryProof(minTimestamp: number, maxTimestamp: number): ProofResult {
+      return {
+        name: "compare_expiry",
+        proof: "",
+        total: 1,
+        committedInputs: {
+          compare_expiry: { minDateTimestamp: minTimestamp, maxDateTimestamp: maxTimestamp },
+        },
+      }
+    }
+
+    test("fails when gte expected differs from originalQuery", () => {
+      const proof = makeExpiryProof(0, 0)
+      const originalQuery: Query = { expiry_date: { gte: new Date("2030-01-01") } }
+      const queryResult: QueryResult = {
+        expiry_date: { gte: { expected: new Date("2025-01-01"), result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkExpiryDatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.expiry_date, "gte")).toBe(true)
+    })
+
+    test("fails when gt not in originalQuery", () => {
+      const proof = makeExpiryProof(0, 0)
+      const originalQuery: Query = {}
+      const queryResult: QueryResult = {
+        expiry_date: { gt: { expected: new Date("2025-01-01"), result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkExpiryDatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.expiry_date, "gt")).toBe(true)
+    })
+
+    test("fails when lt not in originalQuery", () => {
+      const proof = makeExpiryProof(0, 0)
+      const originalQuery: Query = {}
+      const queryResult: QueryResult = {
+        expiry_date: { lt: { expected: new Date("2030-01-01"), result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkExpiryDatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.expiry_date, "lt")).toBe(true)
+    })
+
+    test("fails when lte expected differs from originalQuery", () => {
+      const proof = makeExpiryProof(0, 0)
+      const originalQuery: Query = { expiry_date: { lte: new Date("2030-01-01") } }
+      const queryResult: QueryResult = {
+        expiry_date: { lte: { expected: new Date("2035-01-01"), result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkExpiryDatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.expiry_date, "lte")).toBe(true)
+    })
+
+    test("fails when range differs from originalQuery", () => {
+      const proof = makeExpiryProof(0, 0)
+      const originalQuery: Query = {
+        expiry_date: { range: [new Date("2025-01-01"), new Date("2035-01-01")] },
+      }
+      const queryResult: QueryResult = {
+        expiry_date: {
+          range: { expected: [new Date("2020-01-01"), new Date("2035-01-01")], result: true },
+        },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkExpiryDatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.expiry_date, "range")).toBe(true)
+    })
+  })
+
+  describe("checkNationalityExclusionPublicInputs", () => {
+    test("no originalQuery error when queryResult out matches originalQuery", () => {
+      const originalQuery: Query = { nationality: { out: ["USA", "GBR"] } }
+      const queryResult: QueryResult = {
+        nationality: { out: { expected: ["USA", "GBR"], result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkNationalityExclusionPublicInputs(
+        originalQuery,
+        queryResult,
+        ["USA", "GBR"],
+      )
+      expect(hasOriginalQueryError(queryResultErrors.nationality, "out")).toBe(false)
+    })
+
+    test("fails when queryResult out differs from originalQuery", () => {
+      const originalQuery: Query = { nationality: { out: ["USA", "GBR"] } }
+      const queryResult: QueryResult = {
+        nationality: { out: { expected: ["USA", "FRA"], result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkNationalityExclusionPublicInputs(
+        originalQuery,
+        queryResult,
+        ["USA", "FRA"],
+      )
+      expect(hasOriginalQueryError(queryResultErrors.nationality, "out")).toBe(true)
+    })
+
+    test("fails when queryResult has out but originalQuery does not", () => {
+      const originalQuery: Query = {}
+      const queryResult: QueryResult = {
+        nationality: { out: { expected: ["USA"], result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkNationalityExclusionPublicInputs(
+        originalQuery,
+        queryResult,
+        ["USA"],
+      )
+      expect(hasOriginalQueryError(queryResultErrors.nationality, "out")).toBe(true)
+    })
+  })
+
+  describe("checkNationalityInclusionPublicInputs", () => {
+    test("no originalQuery error when queryResult in matches originalQuery", () => {
+      const originalQuery: Query = { nationality: { in: ["FRA", "DEU"] } }
+      const queryResult: QueryResult = {
+        nationality: { in: { expected: ["FRA", "DEU"], result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkNationalityInclusionPublicInputs(
+        originalQuery,
+        queryResult,
+        ["FRA", "DEU"],
+      )
+      expect(hasOriginalQueryError(queryResultErrors.nationality, "in")).toBe(false)
+    })
+
+    test("fails when queryResult in differs from originalQuery", () => {
+      const originalQuery: Query = { nationality: { in: ["FRA", "DEU"] } }
+      const queryResult: QueryResult = {
+        nationality: { in: { expected: ["FRA", "ITA"], result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkNationalityInclusionPublicInputs(
+        originalQuery,
+        queryResult,
+        ["FRA", "ITA"],
+      )
+      expect(hasOriginalQueryError(queryResultErrors.nationality, "in")).toBe(true)
+    })
+  })
+
+  describe("checkIssuingCountryExclusionPublicInputs", () => {
+    test("fails when queryResult out not in originalQuery", () => {
+      const originalQuery: Query = {}
+      const queryResult: QueryResult = {
+        issuing_country: { out: { expected: ["USA"], result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkIssuingCountryExclusionPublicInputs(
+        originalQuery,
+        queryResult,
+        ["USA"],
+      )
+      expect(hasOriginalQueryError(queryResultErrors.issuing_country, "out")).toBe(true)
+    })
+  })
+
+  describe("checkIssuingCountryInclusionPublicInputs", () => {
+    test("fails when queryResult in not in originalQuery", () => {
+      const originalQuery: Query = {}
+      const queryResult: QueryResult = {
+        issuing_country: { in: { expected: ["FRA"], result: true } },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkIssuingCountryInclusionPublicInputs(
+        originalQuery,
+        queryResult,
+        ["FRA"],
+      )
+      expect(hasOriginalQueryError(queryResultErrors.issuing_country, "in")).toBe(true)
+    })
+  })
+
+  describe("checkBindPublicInputs", () => {
+    test("no originalQuery error when queryResult bind matches originalQuery", () => {
+      const originalQuery: Query = {
+        bind: { user_address: "0x1234abcd", chain: "ethereum", custom_data: "test" },
+      }
+      const queryResult: QueryResult = {
+        bind: { user_address: "0x1234abcd", chain: "ethereum", custom_data: "test" },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkBindPublicInputs(
+        originalQuery,
+        queryResult,
+        { user_address: "0x1234abcd", chain: "ethereum", custom_data: "test" },
+      )
+      expect(hasOriginalQueryError(queryResultErrors.bind, "eq")).toBe(false)
+    })
+
+    test("fails when queryResult bind user_address differs from originalQuery", () => {
+      const originalQuery: Query = {
+        bind: { user_address: "0x1234abcd", chain: "ethereum" },
+      }
+      const queryResult: QueryResult = {
+        bind: { user_address: "0xdeadbeef", chain: "ethereum" },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkBindPublicInputs(
+        originalQuery,
+        queryResult,
+        { user_address: "0xdeadbeef", chain: "ethereum" },
+      )
+      expect(hasOriginalQueryError(queryResultErrors.bind, "eq")).toBe(true)
+    })
+
+    test("fails when queryResult has bind but originalQuery does not", () => {
+      const originalQuery: Query = {}
+      const queryResult: QueryResult = {
+        bind: { user_address: "0x1234abcd", chain: "ethereum" },
+      }
+      const { queryResultErrors } = PublicInputChecker.checkBindPublicInputs(
+        originalQuery,
+        queryResult,
+        { user_address: "0x1234abcd", chain: "ethereum" },
+      )
+      expect(hasOriginalQueryError(queryResultErrors.bind, "eq")).toBe(true)
+    })
+  })
+
+  describe("checkSanctionsExclusionPublicInputs", () => {
+    test("fails when queryResult has sanctions but originalQuery does not", async () => {
+      const originalQuery: Query = {}
+      const queryResult: QueryResult = {
+        sanctions: { passed: true, isStrict: false },
+      }
+      const sanctionsCommittedInputs = { rootHash: "abc", isStrict: false }
+      const sanctionsBuilder = { getRoot: async () => "abc" } as unknown as SanctionsBuilder
+      const { queryResultErrors } = await PublicInputChecker.checkSanctionsExclusionPublicInputs(
+        originalQuery,
+        queryResult,
+        sanctionsCommittedInputs,
+        sanctionsBuilder,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.sanctions, "eq")).toBe(true)
+    })
+
+    test("fails when strict mode differs from originalQuery", async () => {
+      const originalQuery: Query = {
+        sanctions: { countries: "all", lists: "all", strict: true },
+      }
+      const queryResult: QueryResult = {
+        sanctions: { passed: true, isStrict: false },
+      }
+      const sanctionsCommittedInputs = { rootHash: "abc", isStrict: false }
+      const sanctionsBuilder = { getRoot: async () => "abc" } as unknown as SanctionsBuilder
+      const { queryResultErrors } = await PublicInputChecker.checkSanctionsExclusionPublicInputs(
+        originalQuery,
+        queryResult,
+        sanctionsCommittedInputs,
+        sanctionsBuilder,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.sanctions, "eq")).toBe(true)
+    })
+
+    test("no originalQuery error when strict mode matches", async () => {
+      const originalQuery: Query = {
+        sanctions: { countries: "all", lists: "all", strict: false },
+      }
+      const queryResult: QueryResult = {
+        sanctions: { passed: true, isStrict: false },
+      }
+      const sanctionsCommittedInputs = { rootHash: "abc", isStrict: false }
+      const sanctionsBuilder = { getRoot: async () => "abc" } as unknown as SanctionsBuilder
+      const { queryResultErrors } = await PublicInputChecker.checkSanctionsExclusionPublicInputs(
+        originalQuery,
+        queryResult,
+        sanctionsCommittedInputs,
+        sanctionsBuilder,
+      )
+      expect(hasOriginalQueryError(queryResultErrors.sanctions, "eq")).toBe(false)
+    })
+  })
+
+  describe("checkFacematchPublicInputs", () => {
+    const baseFacematchInputs = {
+      rootKeyLeaf: "0x0",
+      environment: "production" as const,
+      appIdHash: "0x0",
+      integrityPubkeyHash: "0x0",
+    }
+
+    test("fails when facematch mode differs from originalQuery", async () => {
+      const originalQuery: Query = { facematch: { mode: "strict" } }
+      const queryResult: QueryResult = {
+        facematch: { mode: "regular", passed: true },
+      }
+      const { queryResultErrors } = await PublicInputChecker.checkFacematchPublicInputs(
+        originalQuery,
+        queryResult,
+        { ...baseFacematchInputs, mode: "regular" as const },
+      )
+      expect(queryResultErrors.facematch?.eq).toBeDefined()
+      expect(queryResultErrors.facematch!.eq!.message).toContain("facematch mode")
+    })
+
+    test("no facematch mode error when modes match", async () => {
+      const originalQuery: Query = { facematch: { mode: "strict" } }
+      const queryResult: QueryResult = {
+        facematch: { mode: "strict", passed: true },
+      }
+      const { queryResultErrors } = await PublicInputChecker.checkFacematchPublicInputs(
+        originalQuery,
+        queryResult,
+        { ...baseFacematchInputs, mode: "strict" as const },
+      )
+      // Other errors may exist (root key, app id) but mode should not be one
+      const modeMessage = queryResultErrors.facematch?.eq?.message
+      if (modeMessage) {
+        expect(modeMessage).not.toContain("facematch mode")
+      }
+    })
+  })
+})
+
+describe("PublicInputChecker - committed inputs vs queryResult", () => {
+  describe("checkAgePublicInputs", () => {
+    test("passes when committed minAge matches queryResult gte", () => {
+      const proof = makeAgeProof(18, 0)
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+      const { isCorrect } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(true)
+    })
+
+    test("fails when committed minAge does not match queryResult gte expected", () => {
+      const proof = makeAgeProof(16, 0) // committed says 16
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } }, // queryResult says 18
+      }
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.age?.gte).toBeDefined()
+    })
+
+    test("passes when committed maxAge matches queryResult lt", () => {
+      const proof = makeAgeProof(0, 64)
+      const originalQuery: Query = { age: { lt: 65 } }
+      const queryResult: QueryResult = {
+        age: { lt: { expected: 65, result: true } },
+      }
+      const { isCorrect } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(true)
+    })
+
+    test("fails when committed maxAge does not match queryResult lt expected", () => {
+      const proof = makeAgeProof(0, 70)
+      const originalQuery: Query = { age: { lt: 65 } }
+      const queryResult: QueryResult = {
+        age: { lt: { expected: 65, result: true } },
+      }
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.age?.lt).toBeDefined()
+    })
+
+    test("passes when committed range matches queryResult range", () => {
+      const proof = makeAgeProof(18, 65)
+      const originalQuery: Query = { age: { range: [18, 65] } }
+      const queryResult: QueryResult = {
+        age: { range: { expected: [18, 65], result: true } },
+      }
+      const { isCorrect } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(true)
+    })
+
+    test("fails when committed range does not match queryResult range", () => {
+      const proof = makeAgeProof(13, 70)
+      const originalQuery: Query = { age: { range: [18, 65] } }
+      const queryResult: QueryResult = {
+        age: { range: { expected: [18, 65], result: true } },
+      }
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.age?.range).toBeDefined()
+    })
+
+    test("maxAge should be 0 when no upper-bound constraint", () => {
+      const proof = makeAgeProof(18, 5) // maxAge != 0 but no upper-bound query
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.age?.disclose?.message).toContain("Maximum age should be equal to 0")
+    })
+
+    test("minAge should be 0 when no lower-bound constraint", () => {
+      const proof = makeAgeProof(5, 65) // minAge != 0 but no lower-bound query
+      const originalQuery: Query = { age: { lt: 65 } }
+      const queryResult: QueryResult = {
+        age: { lt: { expected: 65, result: true } },
+      }
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.age?.disclose?.message).toContain("Minimum age should be equal to 0")
+    })
+
+    test("fails when age is not set in queryResult", () => {
+      const proof = makeAgeProof(18, 0)
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {}
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.age?.disclose?.message).toContain(
+        "Age is not set in the query result",
+      )
+    })
+
+    test("fails when disclosed age does not match committed", () => {
+      const proof = makeAgeProof(25, 25) // min=max=25 means exact age
+      const originalQuery: Query = { age: { eq: 25, disclose: true } }
+      const queryResult: QueryResult = {
+        age: { disclose: { result: 30 } }, // disclosed 30 but committed 25
+      }
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.age?.disclose?.message).toContain(
+        "Age does not match the disclosed age",
+      )
+    })
+
+    test("passes when committed minAge matches queryResult gt", () => {
+      const proof = makeAgeProof(18, 0)
+      const originalQuery: Query = { age: { gt: 17 } }
+      const queryResult: QueryResult = {
+        age: { gt: { expected: 17, result: true } },
+      }
+      const { isCorrect } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(true)
+    })
+
+    test("fails when committed minAge does not match queryResult gt expected", () => {
+      const proof = makeAgeProof(15, 0) // committed says 15
+      const originalQuery: Query = { age: { gt: 17 } }
+      const queryResult: QueryResult = {
+        age: { gt: { expected: 17, result: true } }, // queryResult says 17
+      }
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.age?.gt).toBeDefined()
+      expect(queryResultErrors.age!.gt!.message).toContain("not greater than")
+    })
+
+    test("passes when committed maxAge matches queryResult lte", () => {
+      const proof = makeAgeProof(0, 65)
+      const originalQuery: Query = { age: { lte: 65 } }
+      const queryResult: QueryResult = {
+        age: { lte: { expected: 65, result: true } },
+      }
+      const { isCorrect } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(true)
+    })
+
+    test("fails when committed maxAge does not match queryResult lte expected", () => {
+      const proof = makeAgeProof(0, 70) // committed says 70
+      const originalQuery: Query = { age: { lte: 65 } }
+      const queryResult: QueryResult = {
+        age: { lte: { expected: 65, result: true } }, // queryResult says 65
+      }
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.age?.lte).toBeDefined()
+      expect(queryResultErrors.age!.lte!.message).toContain("not less than or equal")
+    })
+
+    test("passes when committed minAge and maxAge match queryResult eq", () => {
+      const proof = makeAgeProof(25, 25)
+      const originalQuery: Query = { age: { eq: 25 } }
+      const queryResult: QueryResult = {
+        age: { eq: { expected: 25, result: true } },
+      }
+      const { isCorrect } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(true)
+    })
+
+    test("fails when committed minAge does not match queryResult eq expected", () => {
+      const proof = makeAgeProof(20, 25) // minAge != expected
+      const originalQuery: Query = { age: { eq: 25 } }
+      const queryResult: QueryResult = {
+        age: { eq: { expected: 25, result: true } },
+      }
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.age?.eq).toBeDefined()
+      expect(queryResultErrors.age!.eq!.message).toContain("does not match the expected age")
+    })
+
+    test("fails when committed maxAge does not match queryResult eq expected", () => {
+      const proof = makeAgeProof(25, 30) // maxAge != expected
+      const originalQuery: Query = { age: { eq: 25 } }
+      const queryResult: QueryResult = {
+        age: { eq: { expected: 25, result: true } },
+      }
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkAgePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.age?.eq).toBeDefined()
+      expect(queryResultErrors.age!.eq!.message).toContain("does not match the expected age")
+    })
+  })
+
+  describe("checkBirthdatePublicInputs", () => {
+    // Birthdate timestamps in committed inputs are offset by SECONDS_BETWEEN_1900_AND_1970
+    const offset = SECONDS_BETWEEN_1900_AND_1970
+
+    function birthdateTimestamp(date: Date): number {
+      return Math.floor(date.getTime() / 1000) + offset
+    }
+
+    function makeBirthdateProof(minDate: Date | null, maxDate: Date | null): ProofResult {
+      return {
+        name: "compare_birthdate",
+        proof: "",
+        total: 1,
+        committedInputs: {
+          compare_birthdate: {
+            minDateTimestamp: minDate ? birthdateTimestamp(minDate) : 0,
+            maxDateTimestamp: maxDate ? birthdateTimestamp(maxDate) : 0,
+          },
+        },
+      }
+    }
+
+    test("passes when committed minDate matches queryResult gte", () => {
+      const date = new Date("2000-01-01")
+      const proof = makeBirthdateProof(date, null)
+      const originalQuery: Query = { birthdate: { gte: date } }
+      const queryResult: QueryResult = {
+        birthdate: { gte: { expected: new Date("2000-01-01"), result: true } },
+      }
+      const { isCorrect } = PublicInputChecker.checkBirthdatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(true)
+    })
+
+    test("fails when committed minDate does not match queryResult gte expected", () => {
+      const proof = makeBirthdateProof(new Date("1990-01-01"), null)
+      const originalQuery: Query = { birthdate: { gte: new Date("2000-01-01") } }
+      const queryResult: QueryResult = {
+        birthdate: { gte: { expected: new Date("2000-01-01"), result: true } },
+      }
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkBirthdatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.birthdate?.gte).toBeDefined()
+    })
+
+    test("passes when committed maxDate matches queryResult lte", () => {
+      const date = new Date("2005-06-15")
+      const proof = makeBirthdateProof(null, date)
+      const originalQuery: Query = { birthdate: { lte: date } }
+      const queryResult: QueryResult = {
+        birthdate: { lte: { expected: new Date("2005-06-15"), result: true } },
+      }
+      const { isCorrect } = PublicInputChecker.checkBirthdatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(true)
+    })
+
+    test("fails when committed maxDate does not match queryResult lte expected", () => {
+      const proof = makeBirthdateProof(null, new Date("2010-01-01"))
+      const originalQuery: Query = { birthdate: { lte: new Date("2005-01-01") } }
+      const queryResult: QueryResult = {
+        birthdate: { lte: { expected: new Date("2005-01-01"), result: true } },
+      }
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkBirthdatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.birthdate?.lte).toBeDefined()
+    })
+
+    test("passes when committed minDate matches queryResult gt (offset by +1 day)", () => {
+      const proof = makeBirthdateProof(new Date("1995-01-02"), null)
+      const originalQuery: Query = { birthdate: { gt: new Date("1995-01-01") } }
+      const queryResult: QueryResult = {
+        birthdate: { gt: { expected: new Date("1995-01-01"), result: true } },
+      }
+      const { isCorrect } = PublicInputChecker.checkBirthdatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(true)
+    })
+
+    test("fails when committed minDate does not match queryResult gt expected +1 day", () => {
+      const proof = makeBirthdateProof(new Date("1995-01-01"), null)
+      const originalQuery: Query = { birthdate: { gt: new Date("1995-01-01") } }
+      const queryResult: QueryResult = {
+        birthdate: { gt: { expected: new Date("1995-01-01"), result: true } },
+      }
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkBirthdatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.birthdate?.gt).toBeDefined()
+    })
+
+    test("passes when committed maxDate matches queryResult lt (offset by -1 day)", () => {
+      const proof = makeBirthdateProof(null, new Date("1997-12-30"))
+      const originalQuery: Query = { birthdate: { lt: new Date("1997-12-31") } }
+      const queryResult: QueryResult = {
+        birthdate: { lt: { expected: new Date("1997-12-31"), result: true } },
+      }
+      const { isCorrect } = PublicInputChecker.checkBirthdatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(true)
+    })
+
+    test("fails when committed maxDate does not match queryResult lt expected -1 day", () => {
+      const proof = makeBirthdateProof(null, new Date("1997-12-31"))
+      const originalQuery: Query = { birthdate: { lt: new Date("1997-12-31") } }
+      const queryResult: QueryResult = {
+        birthdate: { lt: { expected: new Date("1997-12-31"), result: true } },
+      }
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkBirthdatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.birthdate?.lt).toBeDefined()
+    })
+
+    test("fails when birthdate is not set in queryResult", () => {
+      const proof = makeBirthdateProof(new Date("2000-01-01"), null)
+      const originalQuery: Query = { birthdate: { gte: new Date("2000-01-01") } }
+      const queryResult: QueryResult = {}
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkBirthdatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.birthdate?.disclose?.message).toContain(
+        "Birthdate is not set in the query result",
+      )
+    })
+  })
+
+  describe("checkExpiryDatePublicInputs", () => {
+    // Expiry date uses direct timestamps (no 1900 offset)
+    function makeExpiryProof(minDate: Date | null, maxDate: Date | null): ProofResult {
+      return {
+        name: "compare_expiry",
+        proof: "",
+        total: 1,
+        committedInputs: {
+          compare_expiry: {
+            minDateTimestamp: minDate ? Math.floor(minDate.getTime() / 1000) : 0,
+            maxDateTimestamp: maxDate ? Math.floor(maxDate.getTime() / 1000) : 0,
+          },
+        },
+      }
+    }
+
+    test("passes when committed minDate matches queryResult gte", () => {
+      const date = new Date("2030-01-01")
+      const proof = makeExpiryProof(date, null)
+      const originalQuery: Query = { expiry_date: { gte: date } }
+      const queryResult: QueryResult = {
+        expiry_date: { gte: { expected: new Date("2030-01-01"), result: true } },
+      }
+      const { isCorrect } = PublicInputChecker.checkExpiryDatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(true)
+    })
+
+    test("fails when committed minDate does not match queryResult gte expected", () => {
+      const proof = makeExpiryProof(new Date("2025-01-01"), null)
+      const originalQuery: Query = { expiry_date: { gte: new Date("2030-01-01") } }
+      const queryResult: QueryResult = {
+        expiry_date: { gte: { expected: new Date("2030-01-01"), result: true } },
+      }
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkExpiryDatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.expiry_date?.gte).toBeDefined()
+    })
+
+    test("fails when expiry date is not set in queryResult", () => {
+      const proof = makeExpiryProof(new Date("2030-01-01"), null)
+      const originalQuery: Query = { expiry_date: { gte: new Date("2030-01-01") } }
+      const queryResult: QueryResult = {}
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkExpiryDatePublicInputs(
+        proof,
+        originalQuery,
+        queryResult,
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.expiry_date?.disclose?.message).toContain(
+        "Expiry date is not set in the query result",
+      )
+    })
+  })
+
+  describe("checkNationalityExclusionPublicInputs", () => {
+    const originalQuery: Query = { nationality: { out: ["GBR", "USA"] } }
+
+    test("passes when country list matches queryResult expected", () => {
+      const queryResult: QueryResult = {
+        nationality: { out: { expected: ["GBR", "USA"], result: true } },
+      }
+      const { isCorrect } = PublicInputChecker.checkNationalityExclusionPublicInputs(
+        originalQuery,
+        queryResult,
+        ["GBR", "USA"],
+      )
+      expect(isCorrect).toBe(true)
+    })
+
+    test("fails when country list does not match queryResult expected", () => {
+      const queryResult: QueryResult = {
+        nationality: { out: { expected: ["GBR", "USA"], result: true } },
+      }
+      // committed list has FRA instead of USA
+      const { isCorrect, queryResultErrors } =
+        PublicInputChecker.checkNationalityExclusionPublicInputs(originalQuery, queryResult, [
+          "FRA",
+          "GBR",
+        ])
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.nationality?.out).toBeDefined()
+    })
+
+    test("fails when nationality out is not set in queryResult", () => {
+      const queryResult: QueryResult = {}
+      const { isCorrect, queryResultErrors } =
+        PublicInputChecker.checkNationalityExclusionPublicInputs(originalQuery, queryResult, [
+          "GBR",
+          "USA",
+        ])
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.nationality?.out?.message).toContain(
+        "Nationality exclusion is not set",
+      )
+    })
+
+    test("fails when country list is not sorted", () => {
+      const queryResult: QueryResult = {
+        nationality: { out: { expected: ["USA", "GBR"], result: true } },
+      }
+      // Unsorted list: USA > GBR alphabetically
+      const { isCorrect, queryResultErrors } =
+        PublicInputChecker.checkNationalityExclusionPublicInputs(
+          { nationality: { out: ["USA", "GBR"] } },
+          queryResult,
+          ["USA", "GBR"],
+        )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.nationality?.out?.message).toContain("not been sorted")
+    })
+  })
+
+  describe("checkNationalityInclusionPublicInputs", () => {
+    const originalQuery: Query = { nationality: { in: ["DEU", "FRA"] } }
+
+    test("passes when country list matches queryResult expected", () => {
+      const queryResult: QueryResult = {
+        nationality: { in: { expected: ["DEU", "FRA"], result: true } },
+      }
+      const { isCorrect } = PublicInputChecker.checkNationalityInclusionPublicInputs(
+        originalQuery,
+        queryResult,
+        ["DEU", "FRA"],
+      )
+      expect(isCorrect).toBe(true)
+    })
+
+    test("fails when country list does not match queryResult expected", () => {
+      const queryResult: QueryResult = {
+        nationality: { in: { expected: ["DEU", "FRA"], result: true } },
+      }
+      const { isCorrect, queryResultErrors } =
+        PublicInputChecker.checkNationalityInclusionPublicInputs(originalQuery, queryResult, [
+          "DEU",
+          "ITA",
+        ])
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.nationality?.in).toBeDefined()
+    })
+
+    test("fails when nationality in is not set in queryResult", () => {
+      const queryResult: QueryResult = {}
+      const { isCorrect, queryResultErrors } =
+        PublicInputChecker.checkNationalityInclusionPublicInputs(originalQuery, queryResult, [
+          "DEU",
+          "FRA",
+        ])
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.nationality?.in?.message).toContain(
+        "Nationality inclusion is not set",
+      )
+    })
+  })
+
+  describe("checkIssuingCountryExclusionPublicInputs", () => {
+    const originalQuery: Query = { issuing_country: { out: ["GBR", "USA"] } }
+
+    test("passes when country list matches queryResult expected", () => {
+      const queryResult: QueryResult = {
+        issuing_country: { out: { expected: ["GBR", "USA"], result: true } },
+      }
+      const { isCorrect } = PublicInputChecker.checkIssuingCountryExclusionPublicInputs(
+        originalQuery,
+        queryResult,
+        ["GBR", "USA"],
+      )
+      expect(isCorrect).toBe(true)
+    })
+
+    test("fails when country list does not match queryResult expected", () => {
+      const queryResult: QueryResult = {
+        issuing_country: { out: { expected: ["GBR", "USA"], result: true } },
+      }
+      const { isCorrect, queryResultErrors } =
+        PublicInputChecker.checkIssuingCountryExclusionPublicInputs(originalQuery, queryResult, [
+          "FRA",
+          "GBR",
+        ])
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.issuing_country?.out).toBeDefined()
+    })
+
+    test("fails when unsorted country list", () => {
+      const queryResult: QueryResult = {
+        issuing_country: { out: { expected: ["USA", "GBR"], result: true } },
+      }
+      const { isCorrect, queryResultErrors } =
+        PublicInputChecker.checkIssuingCountryExclusionPublicInputs(
+          { issuing_country: { out: ["USA", "GBR"] } },
+          queryResult,
+          ["USA", "GBR"],
+        )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.issuing_country?.out?.message).toContain("not been sorted")
+    })
+  })
+
+  describe("checkIssuingCountryInclusionPublicInputs", () => {
+    const originalQuery: Query = { issuing_country: { in: ["DEU", "FRA"] } }
+
+    test("passes when country list matches queryResult expected", () => {
+      const queryResult: QueryResult = {
+        issuing_country: { in: { expected: ["DEU", "FRA"], result: true } },
+      }
+      const { isCorrect } = PublicInputChecker.checkIssuingCountryInclusionPublicInputs(
+        originalQuery,
+        queryResult,
+        ["DEU", "FRA"],
+      )
+      expect(isCorrect).toBe(true)
+    })
+
+    test("fails when country list does not match queryResult expected", () => {
+      const queryResult: QueryResult = {
+        issuing_country: { in: { expected: ["DEU", "FRA"], result: true } },
+      }
+      const { isCorrect, queryResultErrors } =
+        PublicInputChecker.checkIssuingCountryInclusionPublicInputs(originalQuery, queryResult, [
+          "DEU",
+          "ITA",
+        ])
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.issuing_country?.in).toBeDefined()
+    })
+  })
+
+  describe("checkBindPublicInputs", () => {
+    const originalQuery: Query = {
+      bind: { user_address: "0xabcdef", chain: "ethereum", custom_data: "hello" },
+    }
+
+    test("passes when all bound data matches", () => {
+      const queryResult: QueryResult = {
+        bind: { user_address: "0xabcdef", chain: "ethereum", custom_data: "hello" },
+      }
+      const { isCorrect } = PublicInputChecker.checkBindPublicInputs(originalQuery, queryResult, {
+        user_address: "0xabcdef",
+        chain: "ethereum",
+        custom_data: "hello",
+      })
+      expect(isCorrect).toBe(true)
+    })
+
+    test("fails when user_address in bound data does not match queryResult", () => {
+      const oq: Query = {
+        bind: { user_address: "0x999999", chain: "ethereum" },
+      }
+      const queryResult: QueryResult = {
+        bind: { user_address: "0xabcdef", chain: "ethereum" },
+      }
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkBindPublicInputs(
+        oq,
+        queryResult,
+        { user_address: "0x999999", chain: "ethereum" }, // proof has different address than queryResult
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.bind?.eq).toBeDefined()
+    })
+
+    test("fails when chain in bound data does not match queryResult", () => {
+      const oq: Query = {
+        bind: { user_address: "0xabcdef", chain: "ethereum" },
+      }
+      const queryResult: QueryResult = {
+        bind: { user_address: "0xabcdef", chain: "optimism" },
+      }
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkBindPublicInputs(
+        oq,
+        queryResult,
+        { user_address: "0xabcdef", chain: "ethereum" }, // proof has different chain than queryResult
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.bind?.eq).toBeDefined()
+    })
+
+    test("fails when custom_data in bound data does not match queryResult", () => {
+      const oq: Query = {
+        bind: { user_address: "0xabcdef", chain: "ethereum", custom_data: "world" },
+      }
+      const queryResult: QueryResult = {
+        bind: { user_address: "0xabcdef", chain: "ethereum", custom_data: "hello" },
+      }
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkBindPublicInputs(
+        oq,
+        queryResult,
+        { user_address: "0xabcdef", chain: "ethereum", custom_data: "world" }, // proof differs from queryResult
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.bind?.eq).toBeDefined()
+    })
+
+    test("captures all mismatches in a single error when multiple fields differ", () => {
+      // originalQuery matches the committed boundData so the originalQuery check doesn't overwrite
+      const oq: Query = {
+        bind: { user_address: "0xccc", chain: "arbitrum", custom_data: "baz" },
+      }
+      const queryResult: QueryResult = {
+        bind: { user_address: "0xbbb", chain: "ethereum", custom_data: "bar" },
+      }
+      // boundData (committed inputs) differs from the reported queryResult on all fields
+      const { isCorrect, queryResultErrors } = PublicInputChecker.checkBindPublicInputs(
+        oq,
+        queryResult,
+        { user_address: "0xccc", chain: "arbitrum", custom_data: "baz" },
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.bind?.eq).toBeDefined()
+      // The combined error message should mention all three mismatched fields
+      expect(queryResultErrors.bind!.eq!.message).toContain("user_address")
+      expect(queryResultErrors.bind!.eq!.message).toContain("chain")
+      expect(queryResultErrors.bind!.eq!.message).toContain("custom_data")
+    })
+  })
+
+  describe("checkSanctionsExclusionPublicInputs", () => {
+    const originalQuery: Query = {
+      sanctions: { countries: "all", lists: "all", strict: false },
+    }
+    let isSanctionsRootValid: ReturnType<typeof mockSanctionsRootValidity>
+
+    beforeEach(() => {
+      isSanctionsRootValid = mockSanctionsRootValidity()
+    })
+
+    afterEach(() => {
+      isSanctionsRootValid.mockRestore()
+    })
+
+    test("passes when the root is valid in the registry and strict matches", async () => {
+      const queryResult: QueryResult = {
+        sanctions: { passed: true, isStrict: false },
+      }
+      const { isCorrect } = await PublicInputChecker.checkSanctionsExclusionPublicInputs(
+        originalQuery,
+        queryResult,
+        { rootHash: VALID_SANCTIONS_ROOT, isStrict: false },
+      )
+      expect(isCorrect).toBe(true)
+    })
+
+    test("fails when the root is not valid in the registry", async () => {
+      const queryResult: QueryResult = {
+        sanctions: { passed: true, isStrict: false },
+      }
+      const { isCorrect, queryResultErrors } =
+        await PublicInputChecker.checkSanctionsExclusionPublicInputs(originalQuery, queryResult, {
+          rootHash: "0x" + "cd".repeat(32),
+          isStrict: false,
+        })
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.sanctions?.eq?.message).toContain("sanctions registry root")
+    })
+
+    test("fails when the registry lookup throws", async () => {
+      isSanctionsRootValid.mockImplementation(async () => {
+        throw new Error("RPC unavailable")
+      })
+      const queryResult: QueryResult = {
+        sanctions: { passed: true, isStrict: false },
+      }
+      const { isCorrect, queryResultErrors } =
+        await PublicInputChecker.checkSanctionsExclusionPublicInputs(originalQuery, queryResult, {
+          rootHash: VALID_SANCTIONS_ROOT,
+          isStrict: false,
+        })
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.sanctions?.eq?.message).toContain("sanctions registry root")
+    })
+
+    test("fails when strict mode in committed inputs does not match queryResult", async () => {
+      const oq: Query = {
+        sanctions: { countries: "all", lists: "all", strict: true },
+      }
+      const queryResult: QueryResult = {
+        sanctions: { passed: true, isStrict: true },
+      }
+      const { isCorrect, queryResultErrors } =
+        await PublicInputChecker.checkSanctionsExclusionPublicInputs(
+          oq,
+          queryResult,
+          { rootHash: VALID_SANCTIONS_ROOT, isStrict: false }, // committed says non-strict
+        )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.sanctions?.eq?.message).toContain("strict mode")
+    })
+  })
+
+  describe("checkFacematchPublicInputs", () => {
+    const originalQuery: Query = { facematch: { mode: "regular" } }
+
+    function makeFacematchInputs(
+      overrides: Partial<FacematchCommittedInputs> = {},
+    ): FacematchCommittedInputs {
+      return {
+        rootKeyLeaf: APPLE_APP_ATTEST_ROOT_KEY_HASH,
+        environment: "production",
+        appIdHash: ZKPASSPORT_IOS_APP_ID_HASH,
+        mode: "regular",
+        integrityPubkeyHash: "0x0",
+        ...overrides,
+      }
+    }
+
+    test("passes with valid Apple root key, production env, iOS app id", async () => {
+      const queryResult: QueryResult = {
+        facematch: { mode: "regular", passed: true },
+      }
+      const { isCorrect } = await PublicInputChecker.checkFacematchPublicInputs(
+        originalQuery,
+        queryResult,
+        makeFacematchInputs(),
+      )
+      expect(isCorrect).toBe(true)
+    })
+
+    test("passes with valid Google RSA root key and Android app id", async () => {
+      const queryResult: QueryResult = {
+        facematch: { mode: "regular", passed: true },
+      }
+      const { isCorrect } = await PublicInputChecker.checkFacematchPublicInputs(
+        originalQuery,
+        queryResult,
+        makeFacematchInputs({
+          rootKeyLeaf: GOOGLE_APP_ATTEST_RSA_ROOT_KEY_HASH,
+          appIdHash: ZKPASSPORT_ANDROID_APP_ID_HASH,
+        }),
+      )
+      expect(isCorrect).toBe(true)
+    })
+
+    test("fails with invalid root key hash", async () => {
+      const queryResult: QueryResult = {
+        facematch: { mode: "regular", passed: true },
+      }
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkFacematchPublicInputs(
+        originalQuery,
+        queryResult,
+        makeFacematchInputs({ rootKeyLeaf: "0xbadkey" }),
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.facematch?.eq?.message).toContain("root key")
+    })
+
+    test("fails with non-production environment", async () => {
+      const queryResult: QueryResult = {
+        facematch: { mode: "regular", passed: true },
+      }
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkFacematchPublicInputs(
+        originalQuery,
+        queryResult,
+        makeFacematchInputs({ environment: "development" }),
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.facematch?.eq?.message).toContain("production")
+    })
+
+    test("fails with invalid app id hash", async () => {
+      const queryResult: QueryResult = {
+        facematch: { mode: "regular", passed: true },
+      }
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkFacematchPublicInputs(
+        originalQuery,
+        queryResult,
+        makeFacematchInputs({ appIdHash: "0xbadappid" }),
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.facematch?.eq?.message).toContain("app id")
+    })
+
+    test("fails when committed mode does not match queryResult mode", async () => {
+      const queryResult: QueryResult = {
+        facematch: { mode: "regular", passed: true },
+      }
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkFacematchPublicInputs(
+        originalQuery,
+        queryResult,
+        makeFacematchInputs({ mode: "strict" }), // committed says strict, queryResult says regular
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.facematch?.eq?.message).toContain("facematch mode")
+    })
+
+    test("validates committed inputs even when queryResult is omitted", async () => {
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkFacematchPublicInputs(
+        originalQuery,
+        {}, // prover omits the facematch result
+        makeFacematchInputs({ rootKeyLeaf: "0xbadkey" }),
+      )
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.facematch?.eq?.message).toContain("root key")
+    })
+  })
+})
+
+/**
+ * Build a synthetic proof hex string from an array of field values (bigints).
+ * Each field becomes a 32-byte big-endian hex chunk.
+ * `publicInputs` are placed first, followed by `dummyProofFieldCount` zero fields.
+ * Layout: [public_inputs][proof_body] — no prefix (matches normalised format
+ * consumed by `getProofData` with default offset 0).
+ */
+function buildProofHex(publicInputs: bigint[], dummyProofFieldCount = 10): string {
+  const fields = [...publicInputs, ...new Array(dummyProofFieldCount).fill(0n)]
+  return fields.map((v) => BigInt(v).toString(16).padStart(64, "0")).join("")
+}
+
+/** Get today at midnight (matching what checkPublicInputs uses) */
+function getTodayTimestamp(): number {
+  const now = new Date()
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0)
+  return Math.floor(today.getTime() / 1000)
+}
+
+describe("PublicInputChecker - checkPublicInputs", () => {
+  // We mock checkCertificateRegistryRoot and checkCircuitRegistryRoot
+  // since they make on-chain RPC calls. We spy on them to return success.
+
+  const successResult = { isCorrect: true, queryResultErrors: {} }
+  const originalCheckCert = PublicInputChecker.checkCertificateRegistryRoot
+  const originalCheckCircuit = PublicInputChecker.checkCircuitRegistryRoot
+
+  beforeEach(() => {
+    // Override on-chain registry checks with mocks
+    ;(PublicInputChecker as unknown as Record<string, unknown>).checkCertificateRegistryRoot =
+      async () => successResult
+    ;(PublicInputChecker as unknown as Record<string, unknown>).checkCircuitRegistryRoot =
+      async () => successResult
+  })
+
+  afterEach(() => {
+    ;(PublicInputChecker as unknown as Record<string, unknown>).checkCertificateRegistryRoot =
+      originalCheckCert
+    ;(PublicInputChecker as unknown as Record<string, unknown>).checkCircuitRegistryRoot =
+      originalCheckCircuit
+  })
+
+  describe("non-outer proof path - commitment chain", () => {
+    const domain = "example.com"
+    const domainScopeHash = getServiceScopeHash(domain)
+    const todayTs = BigInt(getTodayTimestamp())
+    // Shared commitment value used to link proofs
+    const commitment1 = 111n
+    const commitment2 = 222n
+    const commitment3 = 333n
+    const nullifier = 999n
+
+    function makeDSCProof(merkleRoot: bigint, commitmentOut: bigint): ProofResult {
+      // DSC proof: 2 public inputs [merkleRoot, commitmentOut]
+      return {
+        name: "sig_check_dsc_1234",
+        proof: buildProofHex([merkleRoot, commitmentOut]),
+        total: 5,
+      }
+    }
+
+    function makeIDDataProof(commitmentIn: bigint, commitmentOut: bigint): ProofResult {
+      // ID data proof: 2 public inputs [commitmentIn, commitmentOut]
+      return {
+        name: "sig_check_id_data_1234",
+        proof: buildProofHex([commitmentIn, commitmentOut]),
+        total: 5,
+      }
+    }
+
+    function makeIntegrityProof(commitmentIn: bigint, commitmentOut: bigint): ProofResult {
+      // Integrity proof: 2 public inputs [commitmentIn, commitmentOut]
+      return {
+        name: "data_check_integrity_1234",
+        proof: buildProofHex([commitmentIn, commitmentOut]),
+        total: 5,
+      }
+    }
+
+    async function makeAgeDisclosureProof(
+      commitmentIn: bigint,
+      opts: { minAge?: number; maxAge?: number; scope?: bigint; subscope?: bigint } = {},
+    ): Promise<ProofResult> {
+      // Disclosure proof: 7 public inputs
+      // [commitmentIn, currentDate, serviceScope, subscope, paramCommitment, nullifierType, nullifier]
+      const scope = opts.scope ?? domainScopeHash
+      const subscope = opts.subscope ?? 0n
+      const minAge = opts.minAge ?? 18
+      const maxAge = opts.maxAge ?? 0
+      const paramCommitment = await getAgeParameterCommitment(minAge, maxAge)
+      return {
+        name: "compare_age",
+        proof: buildProofHex([
+          commitmentIn,
+          todayTs,
+          scope,
+          subscope,
+          paramCommitment,
+          0n,
+          nullifier,
+        ]),
+        total: 5,
+        committedInputs: {
+          compare_age: { minAge, maxAge },
+        },
+      }
+    }
+
+    test("valid commitment chain passes", async () => {
+      const proofs = [
+        makeDSCProof(1n, commitment1),
+        makeIDDataProof(commitment1, commitment2),
+        makeIntegrityProof(commitment2, commitment3),
+        await makeAgeDisclosureProof(commitment3),
+      ]
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+
+      const { queryResultErrors, uniqueIdentifier } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365, // large validity
+      )
+
+      // Commitment chain should pass; age check should pass
+      expect(queryResultErrors.sig_check_id_data?.commitment).toBeUndefined()
+      expect(queryResultErrors.data_check_integrity?.commitment).toBeUndefined()
+      expect(queryResultErrors.age?.commitment).toBeUndefined()
+      expect(uniqueIdentifier).toBe(nullifier.toString(10))
+    })
+
+    test("broken commitment chain between DSC and ID data fails", async () => {
+      const proofs = [
+        makeDSCProof(1n, commitment1),
+        makeIDDataProof(999n, commitment2), // commitmentIn doesn't match DSC's commitmentOut
+        makeIntegrityProof(commitment2, commitment3),
+        await makeAgeDisclosureProof(commitment3),
+      ]
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+
+      const { queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      expect(queryResultErrors.sig_check_id_data?.commitment).toBeDefined()
+      expect(queryResultErrors.sig_check_id_data!.commitment!.message).toContain(
+        "certificate signature and ID signature",
+      )
+    })
+
+    test("broken commitment chain between ID data and integrity fails", async () => {
+      const proofs = [
+        makeDSCProof(1n, commitment1),
+        makeIDDataProof(commitment1, commitment2),
+        makeIntegrityProof(999n, commitment3), // commitmentIn doesn't match
+        await makeAgeDisclosureProof(commitment3),
+      ]
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+
+      const { queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      expect(queryResultErrors.data_check_integrity?.commitment).toBeDefined()
+      expect(queryResultErrors.data_check_integrity!.commitment!.message).toContain(
+        "ID signature and the data signed",
+      )
+    })
+
+    test("broken commitment chain between integrity and disclosure fails", async () => {
+      const proofs = [
+        makeDSCProof(1n, commitment1),
+        makeIDDataProof(commitment1, commitment2),
+        makeIntegrityProof(commitment2, commitment3),
+        await makeAgeDisclosureProof(999n), // commitmentIn doesn't match integrity's commitmentOut
+      ]
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+
+      const { queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      expect(queryResultErrors.age?.commitment).toBeDefined()
+      expect(queryResultErrors.age!.commitment!.message).toContain("validity of the ID and the age")
+    })
+
+    test("proofs are sorted by expected order regardless of input order", async () => {
+      // Provide proofs in wrong order - they should be sorted internally
+      // Use only the signature/integrity proofs to test sorting without
+      // disclosure param commitment complexity
+      const proofs = [
+        makeIntegrityProof(commitment2, commitment3),
+        makeDSCProof(1n, commitment1),
+        makeIDDataProof(commitment1, commitment2),
+      ]
+      const originalQuery: Query = {}
+      const queryResult: QueryResult = {}
+
+      const { queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      // Commitment chain between DSC → IDData → Integrity should pass
+      // because proofs are sorted internally
+      expect(queryResultErrors.sig_check_id_data?.commitment).toBeUndefined()
+      expect(queryResultErrors.data_check_integrity?.commitment).toBeUndefined()
+    })
+  })
+
+  describe("non-outer proof path - scope validation", () => {
+    const domain = "example.com"
+    const domainScopeHash = getServiceScopeHash(domain)
+    const todayTs = BigInt(getTodayTimestamp())
+    const commitment = 100n
+    const nullifier = 42n
+
+    function makeDisclosureAge(scope: bigint, subscope: bigint): ProofResult {
+      return {
+        name: "compare_age",
+        proof: buildProofHex([commitment, todayTs, scope, subscope, 0n, 0n, nullifier]),
+        total: 1,
+        committedInputs: {
+          compare_age: { minAge: 18, maxAge: 0 },
+        },
+      }
+    }
+
+    test("fails when proof domain scope does not match expected", async () => {
+      const wrongScope = getServiceScopeHash("wrong-domain.com")
+      const proofs = [makeDisclosureAge(wrongScope, 0n)]
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.age?.scope?.message).toContain("different domain")
+    })
+
+    test("fails when proof subscope does not match expected", async () => {
+      const wrongSubscope = getScopeHash("wrong-scope")
+      const proofs = [makeDisclosureAge(domainScopeHash, wrongSubscope)]
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+        "my-scope",
+      )
+
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.age?.scope?.message).toContain("different scope")
+    })
+
+    test("passes when scope and subscope match", async () => {
+      const scopeValue = "my-scope"
+      const subscope = getScopeHash(scopeValue)
+      const proofs = [makeDisclosureAge(domainScopeHash, subscope)]
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+
+      const { queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+        scopeValue,
+      )
+
+      expect(queryResultErrors.age?.scope).toBeUndefined()
+    })
+
+    test("fails when the proof has a scope but none is passed", async () => {
+      const proofSubscope = getScopeHash("my-scope")
+      const proofs = [makeDisclosureAge(domainScopeHash, proofSubscope)]
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.age?.scope?.message).toContain("none was passed")
+      expect(queryResultErrors.age?.scope?.received).toContain(proofSubscope.toString())
+    })
+  })
+
+  describe("non-outer proof path - current date validation", () => {
+    const domain = "example.com"
+    const domainScopeHash = getServiceScopeHash(domain)
+    const commitment = 100n
+    const nullifier = 42n
+
+    test("fails when proof date is too old", async () => {
+      // Use a date from 30 days ago
+      const oldTs = BigInt(getTodayTimestamp() - 86400 * 30)
+      const proofs: ProofResult[] = [
+        {
+          name: "compare_age",
+          proof: buildProofHex([commitment, oldTs, domainScopeHash, 0n, 0n, 0n, nullifier]),
+          total: 1,
+          committedInputs: {
+            compare_age: { minAge: 18, maxAge: 0 },
+          },
+        },
+      ]
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400, // 1 day validity
+      )
+
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.age?.date?.message).toContain("validity period")
+    })
+
+    test("passes when proof date is within validity period", async () => {
+      const recentTs = BigInt(getTodayTimestamp())
+      const proofs: ProofResult[] = [
+        {
+          name: "compare_age",
+          proof: buildProofHex([commitment, recentTs, domainScopeHash, 0n, 0n, 0n, nullifier]),
+          total: 1,
+          committedInputs: {
+            compare_age: { minAge: 18, maxAge: 0 },
+          },
+        },
+      ]
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+
+      const { queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365, // large validity
+      )
+
+      expect(queryResultErrors.age?.date).toBeUndefined()
+    })
+
+    test("fails when proof date is exactly at the validity boundary", async () => {
+      const validitySeconds = 86400 // 1 day
+      // Proof date exactly `validitySeconds` ago: todayToCurrentDate == expectedDifference
+      // The condition is `>=`, so this should fail
+      const boundaryTs = BigInt(getTodayTimestamp() - validitySeconds)
+      const proofs: ProofResult[] = [
+        {
+          name: "compare_age",
+          proof: buildProofHex([commitment, boundaryTs, domainScopeHash, 0n, 0n, 0n, nullifier]),
+          total: 1,
+          committedInputs: {
+            compare_age: { minAge: 18, maxAge: 0 },
+          },
+        },
+      ]
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        validitySeconds,
+      )
+
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.age?.date?.message).toContain("validity period")
+    })
+
+    test("passes when proof date is 1 second before the validity boundary", async () => {
+      const validitySeconds = 86400 // 1 day
+      // Proof date (validitySeconds - 1) ago: todayToCurrentDate < expectedDifference
+      const justInsideTs = BigInt(getTodayTimestamp() - validitySeconds + 1)
+      const proofs: ProofResult[] = [
+        {
+          name: "compare_age",
+          proof: buildProofHex([commitment, justInsideTs, domainScopeHash, 0n, 0n, 0n, nullifier]),
+          total: 1,
+          committedInputs: {
+            compare_age: { minAge: 18, maxAge: 0 },
+          },
+        },
+      ]
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+
+      const { queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        validitySeconds,
+      )
+
+      expect(queryResultErrors.age?.date).toBeUndefined()
+    })
+
+    test("fails when proof date is in the future", async () => {
+      const futureTs = BigInt(getTodayTimestamp() + 86400 * 365 * 3)
+      const proofs: ProofResult[] = [
+        {
+          name: "compare_age",
+          proof: buildProofHex([commitment, futureTs, domainScopeHash, 0n, 0n, 0n, nullifier]),
+          total: 1,
+          committedInputs: {
+            compare_age: { minAge: 18, maxAge: 0 },
+          },
+        },
+      ]
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365, // large validity, so only the future bound can fail the date
+      )
+
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.age?.date?.message).toContain("in the future")
+    })
+
+    test("passes when proof date is within the future tolerance", async () => {
+      const halfDayAheadTs = BigInt(getTodayTimestamp() + 43200) // 12h ahead, inside 1-day buffer
+      const proofs: ProofResult[] = [
+        {
+          name: "compare_age",
+          proof: buildProofHex([
+            commitment,
+            halfDayAheadTs,
+            domainScopeHash,
+            0n,
+            0n,
+            0n,
+            nullifier,
+          ]),
+          total: 1,
+          committedInputs: {
+            compare_age: { minAge: 18, maxAge: 0 },
+          },
+        },
+      ]
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+
+      const { queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      expect(queryResultErrors.age?.date).toBeUndefined()
+    })
+  })
+
+  describe("outer proof path - current date validation", () => {
+    const domain = "example.com"
+    const domainScopeHash = getServiceScopeHash(domain)
+    const nullifier = 42n
+
+    // Outer proof public inputs for `outer_4` (1 disclosure proof → 8 public inputs):
+    // [certRegistryRoot, circuitRegistryRoot, currentDate, serviceScope, subscope,
+    //  paramCommitment, nullifierType, nullifier]
+    function makeOuterProof(currentDateTs: bigint): ProofResult {
+      return {
+        name: "outer_4",
+        proof: buildProofHex([
+          1n, // certRegistryRoot (mocked)
+          2n, // circuitRegistryRoot (mocked)
+          currentDateTs,
+          domainScopeHash,
+          0n, // subscope
+          0n, // paramCommitment (will fail param check, but we're testing date)
+          0n, // nullifierType
+          nullifier,
+        ]),
+        total: 1,
+        committedInputs: {},
+      }
+    }
+
+    test("fails when outer proof date is too old", async () => {
+      const oldTs = BigInt(getTodayTimestamp() - 86400 * 30) // 30 days ago
+      const proofs = [makeOuterProof(oldTs)]
+
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        {},
+        {},
+        86400, // 1 day validity
+      )
+
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.outer?.date?.message).toContain("validity period")
+    })
+
+    test("passes when outer proof date is within validity period", async () => {
+      const recentTs = BigInt(getTodayTimestamp())
+      const proofs = [makeOuterProof(recentTs)]
+
+      const { queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        {},
+        {},
+        86400 * 365, // large validity
+      )
+
+      expect(queryResultErrors.outer?.date).toBeUndefined()
+    })
+
+    test("fails when outer proof date is exactly at the validity boundary", async () => {
+      const validitySeconds = 86400
+      const boundaryTs = BigInt(getTodayTimestamp() - validitySeconds)
+      const proofs = [makeOuterProof(boundaryTs)]
+
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        {},
+        {},
+        validitySeconds,
+      )
+
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.outer?.date?.message).toContain("validity period")
+    })
+
+    test("fails when outer proof date is in the future (age inflation)", async () => {
+      const futureTs = BigInt(getTodayTimestamp() + 86400 * 365 * 3) // 3 years ahead
+      const proofs = [makeOuterProof(futureTs)]
+
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        {},
+        {},
+        86400 * 365,
+      )
+
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.outer?.date?.message).toContain("in the future")
+    })
+
+    test("passes when outer proof date is within the future tolerance", async () => {
+      const halfDayAheadTs = BigInt(getTodayTimestamp() + 43200) // 12h ahead, inside 1-day skew
+      const proofs = [makeOuterProof(halfDayAheadTs)]
+
+      const { queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        {},
+        {},
+        86400 * 365,
+      )
+
+      expect(queryResultErrors.outer?.date).toBeUndefined()
+    })
+  })
+
+  describe("outer proof path - scope validation", () => {
+    const domain = "example.com"
+    const domainScopeHash = getServiceScopeHash(domain)
+    const nullifier = 42n
+
+    // Outer proof public inputs: [certRegistryRoot, circuitRegistryRoot, currentDate,
+    // serviceScope, subscope, paramCommitment, nullifierType, nullifier]
+    function makeScopedOuterProof(subscope: bigint): ProofResult {
+      return {
+        name: "outer_4",
+        proof: buildProofHex([
+          1n, // certRegistryRoot (mocked)
+          2n, // circuitRegistryRoot (mocked)
+          BigInt(getTodayTimestamp()),
+          domainScopeHash,
+          subscope,
+          0n, // paramCommitment
+          0n, // nullifierType
+          nullifier,
+        ]),
+        total: 1,
+        committedInputs: {},
+      }
+    }
+
+    test("fails when the outer proof has a scope but none is passed", async () => {
+      const proofs = [makeScopedOuterProof(getScopeHash("my-scope"))]
+
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        {},
+        {},
+        86400 * 365,
+      )
+
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.outer?.scope?.message).toContain("none was passed")
+    })
+  })
+
+  describe("outer proof path - bundle composition", () => {
+    const domain = "example.com"
+    const domainScopeHash = getServiceScopeHash(domain)
+    const todayTs = BigInt(getTodayTimestamp())
+    const nullifierA = 111n
+    const nullifierB = 222n
+    const originalQuery: Query = { age: { gte: 18 } }
+    const queryResult: QueryResult = { age: { gte: { expected: 18, result: true } } }
+
+    // Outer proof public inputs: [certRegistryRoot, circuitRegistryRoot, currentDate,
+    // serviceScope, subscope, paramCommitment, nullifierType, nullifier]
+    async function makeAgeOuterProof(nullifier: bigint): Promise<ProofResult> {
+      return {
+        name: "outer_4",
+        proof: buildProofHex([
+          1n,
+          2n,
+          todayTs,
+          domainScopeHash,
+          0n,
+          await getAgeParameterCommitment(18, 0),
+          0n,
+          nullifier,
+        ]),
+        total: 1,
+        committedInputs: { compare_age: { minAge: 18, maxAge: 0 } },
+      }
+    }
+
+    async function makeEmptyDiscloseOuterProof(nullifier: bigint): Promise<ProofResult> {
+      const empty = new Array(90).fill(0)
+      return {
+        name: "outer_4",
+        proof: buildProofHex([
+          1n,
+          2n,
+          todayTs,
+          domainScopeHash,
+          0n,
+          await getDiscloseParameterCommitment(empty, empty),
+          0n,
+          nullifier,
+        ]),
+        total: 1,
+        committedInputs: {
+          disclose_bytes: { discloseMask: empty, disclosedBytes: empty } as DiscloseCommittedInputs,
+        },
+      }
+    }
+
+    // Another document's subproof chain, ending in an empty disclosure
+    async function makeSubproofChain(nullifier: bigint): Promise<ProofResult[]> {
+      const empty = new Array(90).fill(0)
+      return [
+        { name: "sig_check_dsc_1234", proof: buildProofHex([1n, 10n]), total: 4 },
+        { name: "sig_check_id_data_1234", proof: buildProofHex([10n, 20n]), total: 4 },
+        { name: "data_check_integrity_1234", proof: buildProofHex([20n, 30n]), total: 4 },
+        {
+          name: "disclose_bytes",
+          // [commitmentIn, currentDate, serviceScope, subscope, paramCommitment, nullifierType, nullifier]
+          proof: buildProofHex([
+            30n,
+            todayTs,
+            domainScopeHash,
+            0n,
+            await getDiscloseParameterCommitment(empty, empty),
+            0n,
+            nullifier,
+          ]),
+          total: 4,
+          committedInputs: {
+            disclose_bytes: {
+              discloseMask: empty,
+              disclosedBytes: empty,
+            } as DiscloseCommittedInputs,
+          },
+        },
+      ]
+    }
+
+    test("a lone outer proof passes with its own nullifier", async () => {
+      const { isCorrect, uniqueIdentifier } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        [await makeAgeOuterProof(nullifierA)],
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      expect(isCorrect).toBe(true)
+      expect(uniqueIdentifier).toBe(nullifierA.toString(10))
+    })
+
+    test("fails when an outer proof is bundled with another document's subproof chain", async () => {
+      const proofs = [await makeAgeOuterProof(nullifierA), ...(await makeSubproofChain(nullifierB))]
+
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.outer?.commitment?.message).toContain("only proof")
+    })
+
+    test("fails when two outer proofs are bundled together", async () => {
+      const proofs = [
+        await makeAgeOuterProof(nullifierA),
+        await makeEmptyDiscloseOuterProof(nullifierB),
+      ]
+
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.outer?.commitment?.message).toContain("only proof")
+    })
+  })
+
+  describe("non-outer proof path - nullifier extraction", () => {
+    const domain = "example.com"
+    const domainScopeHash = getServiceScopeHash(domain)
+    const todayTs = BigInt(getTodayTimestamp())
+    const commitment = 100n
+
+    test("returns unique identifier from disclosure proof", async () => {
+      const expectedNullifier = 123456789n
+      const proofs: ProofResult[] = [
+        {
+          name: "compare_age",
+          proof: buildProofHex([
+            commitment,
+            todayTs,
+            domainScopeHash,
+            0n,
+            0n,
+            0n, // nullifier type
+            expectedNullifier,
+          ]),
+          total: 1,
+          committedInputs: {
+            compare_age: { minAge: 18, maxAge: 0 },
+          },
+        },
+      ]
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+
+      const { uniqueIdentifier } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      expect(uniqueIdentifier).toBe(expectedNullifier.toString(10))
+    })
+  })
+
+  describe("non-outer proof path - unhandled proof names", () => {
+    const domain = "example.com"
+    const domainScopeHash = getServiceScopeHash(domain)
+    const todayTs = BigInt(getTodayTimestamp())
+    const originalQuery: Query = { age: { gte: 18 } }
+    const queryResult: QueryResult = { age: { gte: { expected: 18, result: true } } }
+
+    const chain: ProofResult[] = [
+      { name: "sig_check_dsc_1234", proof: buildProofHex([1n, 10n]), total: 5 },
+      { name: "sig_check_id_data_1234", proof: buildProofHex([10n, 20n]), total: 5 },
+      { name: "data_check_integrity_1234", proof: buildProofHex([20n, 30n]), total: 5 },
+    ]
+
+    async function makeAgeProof(name: string): Promise<ProofResult> {
+      return {
+        name,
+        proof: buildProofHex([
+          30n,
+          todayTs,
+          domainScopeHash,
+          0n,
+          await getAgeParameterCommitment(18, 0),
+          0n,
+          42n,
+        ]),
+        total: 5,
+        committedInputs: { [name]: { minAge: 18, maxAge: 0 } },
+      }
+    }
+
+    async function check(proofs: ProofResult[]) {
+      return PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+    }
+
+    test("passes a chain with a standard age proof", async () => {
+      const { isCorrect } = await check([...chain, await makeAgeProof("compare_age")])
+
+      expect(isCorrect).toBe(true)
+    })
+
+    test("fails when a lone EVM disclosure proof covers the query", async () => {
+      const { isCorrect } = await check([await makeAgeProof("compare_age_evm")])
+
+      expect(isCorrect).toBe(false)
+    })
+
+    test("fails when an EVM disclosure proof is bundled with a chain", async () => {
+      const { isCorrect } = await check([...chain, await makeAgeProof("compare_age_evm")])
+
+      expect(isCorrect).toBe(false)
+    })
+
+    test("fails when a proof has an unknown name", async () => {
+      const { isCorrect } = await check([
+        ...chain,
+        await makeAgeProof("compare_age"),
+        { name: "unknown_circuit", proof: buildProofHex([30n]), total: 5 },
+      ])
+
+      expect(isCorrect).toBe(false)
+    })
+
+    test("fails when an oprf_auth proof is bundled", async () => {
+      const { isCorrect } = await check([
+        ...chain,
+        await makeAgeProof("compare_age"),
+        { name: "oprf_auth", proof: buildProofHex([30n, 1n, 2n]), total: 5 },
+      ])
+
+      expect(isCorrect).toBe(false)
+    })
+  })
+
+  describe("non-outer proof path - nullifier consistency across disclosure proofs", () => {
+    const domain = "example.com"
+    const domainScopeHash = getServiceScopeHash(domain)
+    const todayTs = BigInt(getTodayTimestamp())
+    const legitOprfKey = { x: 1n, y: 2n }
+    const attackerOprfKey = { x: 3n, y: 4n }
+    const legitNullifier = 111n
+    const attackerNullifier = 222n
+    const originalQuery: Query = { age: { gte: 18 } }
+    const queryResult: QueryResult = { age: { gte: { expected: 18, result: true } } }
+    let fetchSpy: ReturnType<typeof spyOn>
+    let isSanctionsRootValid: ReturnType<typeof mockSanctionsRootValidity>
+
+    beforeEach(() => {
+      fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+        (async () =>
+          new Response(
+            JSON.stringify({
+              key: [legitOprfKey.x.toString(), legitOprfKey.y.toString()],
+              epoch: 0,
+            }),
+          )) as unknown as typeof fetch,
+      )
+      isSanctionsRootValid = mockSanctionsRootValidity()
+    })
+
+    afterEach(() => {
+      fetchSpy.mockRestore()
+      isSanctionsRootValid.mockRestore()
+    })
+
+    const chain: ProofResult[] = [
+      { name: "sig_check_dsc_1234", proof: buildProofHex([1n, 10n]), total: 5 },
+      { name: "sig_check_id_data_1234", proof: buildProofHex([10n, 20n]), total: 5 },
+      { name: "data_check_integrity_1234", proof: buildProofHex([20n, 30n]), total: 5 },
+    ]
+
+    type NullifierFields = { nullifier: bigint; type: NullifierType; oprfKey?: typeof legitOprfKey }
+
+    // Disclosure proof public inputs: [commitmentIn, currentDate, serviceScope, subscope,
+    // paramCommitment, nullifierType, nullifier, oprfPkHash]
+    async function nullifierInputs({ nullifier, type, oprfKey }: NullifierFields) {
+      const oprfPkHash = oprfKey ? await hashOprfPublicKey(oprfKey) : 0n
+      return [BigInt(type), nullifier, oprfPkHash]
+    }
+
+    async function makeAgeProof(fields: NullifierFields): Promise<ProofResult> {
+      return {
+        name: "compare_age",
+        proof: buildProofHex([
+          30n,
+          todayTs,
+          domainScopeHash,
+          0n,
+          await getAgeParameterCommitment(18, 0),
+          ...(await nullifierInputs(fields)),
+        ]),
+        total: 5,
+        committedInputs: { compare_age: { minAge: 18, maxAge: 0 } },
+      }
+    }
+
+    async function makeUnrequestedSanctionsProof(
+      fields: NullifierFields,
+      rootHash = VALID_SANCTIONS_ROOT,
+    ): Promise<ProofResult> {
+      return {
+        name: "exclusion_check_sanctions",
+        proof: buildProofHex([
+          30n,
+          todayTs,
+          domainScopeHash,
+          0n,
+          await getSanctionsParameterCommitment(rootHash, false),
+          ...(await nullifierInputs(fields)),
+        ]),
+        total: 5,
+        committedInputs: {
+          exclusion_check_sanctions: { rootHash, isStrict: false },
+        },
+      }
+    }
+
+    const legit = { nullifier: legitNullifier, type: NullifierType.SALTED, oprfKey: legitOprfKey }
+    const attacker = {
+      nullifier: attackerNullifier,
+      type: NullifierType.SALTED,
+      oprfKey: attackerOprfKey,
+    }
+
+    async function check(disclosureProofs: ProofResult[]) {
+      return PublicInputChecker.checkPublicInputs(
+        domain,
+        [...chain, ...disclosureProofs],
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+    }
+
+    test("passes when every disclosure proof carries the same salted nullifier", async () => {
+      const { isCorrect, uniqueIdentifier, uniqueIdentifierType } = await check([
+        await makeAgeProof(legit),
+        await makeUnrequestedSanctionsProof(legit),
+      ])
+
+      expect(isCorrect).toBe(true)
+      expect(uniqueIdentifier).toBe(legitNullifier.toString(10))
+      expect(uniqueIdentifierType).toBe(NullifierType.SALTED)
+    })
+
+    test("fails when a second proof of the same type uses another OPRF key", async () => {
+      const { isCorrect } = await check([await makeAgeProof(legit), await makeAgeProof(attacker)])
+
+      expect(isCorrect).toBe(false)
+    })
+
+    test("fails when an unrequested proof uses another OPRF key", async () => {
+      const { isCorrect } = await check([
+        await makeAgeProof(legit),
+        await makeUnrequestedSanctionsProof(attacker),
+      ])
+
+      expect(isCorrect).toBe(false)
+    })
+
+    test("fails when every proof uses another OPRF key", async () => {
+      const { isCorrect } = await check([
+        await makeAgeProof(attacker),
+        await makeUnrequestedSanctionsProof(attacker),
+      ])
+
+      expect(isCorrect).toBe(false)
+    })
+
+    test("fails when salted and non-salted nullifiers are mixed", async () => {
+      const { isCorrect } = await check([
+        await makeAgeProof(legit),
+        await makeUnrequestedSanctionsProof({
+          nullifier: attackerNullifier,
+          type: NullifierType.NON_SALTED,
+        }),
+      ])
+
+      expect(isCorrect).toBe(false)
+    })
+
+    test("returns the shared nullifier when another proof carries none", async () => {
+      const { isCorrect, uniqueIdentifier, uniqueIdentifierType } = await check([
+        await makeAgeProof(legit),
+        await makeAgeProof({ nullifier: 0n, type: NullifierType.NONE }),
+      ])
+
+      expect(isCorrect).toBe(true)
+      expect(uniqueIdentifier).toBe(legitNullifier.toString(10))
+      expect(uniqueIdentifierType).toBe(NullifierType.SALTED)
+    })
+
+    test("fails when an unrequested sanctions proof uses an unknown root", async () => {
+      const { isCorrect } = await check([
+        await makeAgeProof(legit),
+        await makeUnrequestedSanctionsProof(legit, "0x" + "cd".repeat(32)),
+      ])
+
+      expect(isCorrect).toBe(false)
+    })
+  })
+
+  describe("non-outer proof path - parameter commitment validation", () => {
+    const domain = "example.com"
+    const domainScopeHash = getServiceScopeHash(domain)
+    const todayTs = BigInt(getTodayTimestamp())
+    const commitmentIn = 100n
+    const nullifier = 42n
+
+    test("fails when parameter commitment does not match calculated", async () => {
+      // The proof has paramCommitment = 0, but the calculated one from committed inputs
+      // will be a real hash. This should fail the commitment check.
+      const proofs: ProofResult[] = [
+        {
+          name: "compare_age",
+          proof: buildProofHex([
+            commitmentIn,
+            todayTs,
+            domainScopeHash,
+            0n,
+            999n, // wrong parameter commitment
+            0n,
+            nullifier,
+          ]),
+          total: 1,
+          committedInputs: {
+            compare_age: { minAge: 18, maxAge: 0 },
+          },
+        },
+      ]
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+
+      const { queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      expect(queryResultErrors.age?.commitment).toBeDefined()
+      expect(queryResultErrors.age!.commitment!.message).toContain("conditions for the age check")
+    })
+  })
+
+  describe("certificate registry root validation", () => {
+    const domain = "example.com"
+    const domainScopeHash = getServiceScopeHash(domain)
+    const todayTs = BigInt(getTodayTimestamp())
+    const commitment = 100n
+    const nullifier = 42n
+
+    test("calls checkCertificateRegistryRoot for DSC proof with the proof's date", async () => {
+      const merkleRoot = 12345n
+      let checkArgs: unknown[] | undefined
+      ;(PublicInputChecker as unknown as Record<string, unknown>).checkCertificateRegistryRoot =
+        async (...args: unknown[]) => {
+          checkArgs = args
+          return { isCorrect: true, queryResultErrors: {} }
+        }
+      const proofs: ProofResult[] = [
+        {
+          name: "sig_check_dsc_1234",
+          proof: buildProofHex([merkleRoot, commitment]),
+          total: 2,
+        },
+        {
+          name: "compare_age",
+          proof: buildProofHex([commitment, todayTs, domainScopeHash, 0n, 0n, 0n, nullifier]),
+          total: 2,
+          committedInputs: {
+            compare_age: { minAge: 18, maxAge: 0 },
+          },
+        },
+      ]
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+
+      await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      expect(checkArgs).toBeDefined()
+      expect(checkArgs![0]).toBe(merkleRoot.toString(16))
+      // Root validity must be checked as of the proof's own date so proofs made
+      // against superseded roots remain verifiable
+      expect(checkArgs![4]).toBe(Number(todayTs))
+    })
+
+    test("does not mistake an oprf_auth proof for the bundle's date source", async () => {
+      const merkleRoot = 12345n
+      let checkArgs: unknown[] | undefined
+      ;(PublicInputChecker as unknown as Record<string, unknown>).checkCertificateRegistryRoot =
+        async (...args: unknown[]) => {
+          checkArgs = args
+          return { isCorrect: true, queryResultErrors: {} }
+        }
+      const proofs: ProofResult[] = [
+        {
+          name: "sig_check_dsc_1234",
+          proof: buildProofHex([merkleRoot, commitment]),
+          total: 3,
+        },
+        // oprf_auth has no date - its public inputs are comm_in and a curve point,
+        // not a timestamp - it must not be picked as the bundle's date source
+        {
+          name: "oprf_auth",
+          proof: buildProofHex([commitment, 1n, 2n]),
+          total: 3,
+        },
+        {
+          name: "compare_age",
+          proof: buildProofHex([commitment, todayTs, domainScopeHash, 0n, 0n, 0n, nullifier]),
+          total: 3,
+          committedInputs: {
+            compare_age: { minAge: 18, maxAge: 0 },
+          },
+        },
+      ]
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+
+      await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      expect(checkArgs).toBeDefined()
+      expect(checkArgs![4]).toBe(Number(todayTs))
+    })
+
+    test("fails when certificate registry root is invalid", async () => {
+      const failResult = {
+        isCorrect: false,
+        queryResultErrors: {
+          sig_check_dsc: {
+            certificate: {
+              expected: "A valid root from ZKPassport Registry",
+              received: "Got invalid certificate registry root",
+              message: "The ID was signed by an unrecognized root certificate",
+            },
+          },
+        },
+      }
+      ;(PublicInputChecker as unknown as Record<string, unknown>).checkCertificateRegistryRoot =
+        async () => failResult
+
+      const proofs: ProofResult[] = [
+        {
+          name: "sig_check_dsc_1234",
+          proof: buildProofHex([999n, commitment]),
+          total: 2,
+        },
+        {
+          name: "compare_age",
+          proof: buildProofHex([commitment, todayTs, domainScopeHash, 0n, 0n, 0n, nullifier]),
+          total: 2,
+          committedInputs: {
+            compare_age: { minAge: 18, maxAge: 0 },
+          },
+        },
+      ]
+      const originalQuery: Query = { age: { gte: 18 } }
+      const queryResult: QueryResult = {
+        age: { gte: { expected: 18, result: true } },
+      }
+
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.sig_check_dsc?.certificate?.message).toContain(
+        "unrecognized root certificate",
+      )
+    })
+  })
+
+  describe("non-outer proof path - bind commitment chain and scope", () => {
+    const domain = "example.com"
+    const domainScopeHash = getServiceScopeHash(domain)
+    const todayTs = BigInt(getTodayTimestamp())
+    const commitment = 100n
+    const nullifier = 42n
+
+    function makeBindProof(commitmentIn: bigint, scope: bigint = domainScopeHash): ProofResult {
+      return {
+        name: "bind",
+        proof: buildProofHex([commitmentIn, todayTs, scope, 0n, 0n, 0n, nullifier]),
+        total: 1,
+        committedInputs: {
+          bind: {
+            data: { user_address: "0xabc", chain: "ethereum", custom_data: "test" },
+          },
+        },
+      }
+    }
+
+    test("fails when bind proof commitmentIn does not match integrity commitmentOut", async () => {
+      const proofs = [makeBindProof(999n)] // wrong commitmentIn
+      const originalQuery: Query = {
+        bind: { user_address: "0xabc", chain: "ethereum", custom_data: "test" },
+      }
+      const queryResult: QueryResult = {
+        bind: { user_address: "0xabc", chain: "ethereum", custom_data: "test" },
+      }
+
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.bind?.commitment).toBeDefined()
+      expect(queryResultErrors.bind!.commitment!.message).toContain("bound data")
+    })
+
+    test("fails when bind proof domain scope does not match expected", async () => {
+      const wrongScope = getServiceScopeHash("wrong-domain.com")
+      const proofs = [makeBindProof(commitment, wrongScope)]
+      const originalQuery: Query = {
+        bind: { user_address: "0xabc", chain: "ethereum", custom_data: "test" },
+      }
+      const queryResult: QueryResult = {
+        bind: { user_address: "0xabc", chain: "ethereum", custom_data: "test" },
+      }
+
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.bind?.scope).toBeDefined()
+      expect(queryResultErrors.bind!.scope!.message).toContain("different domain")
+    })
+  })
+
+  describe("non-outer proof path - sanctions commitment chain and scope", () => {
+    const domain = "example.com"
+    const domainScopeHash = getServiceScopeHash(domain)
+    const todayTs = BigInt(getTodayTimestamp())
+    const commitment = 100n
+    const nullifier = 42n
+    let isSanctionsRootValid: ReturnType<typeof mockSanctionsRootValidity>
+
+    beforeEach(() => {
+      isSanctionsRootValid = mockSanctionsRootValidity()
+    })
+
+    afterEach(() => {
+      isSanctionsRootValid.mockRestore()
+    })
+
+    function makeSanctionsProof(
+      commitmentIn: bigint,
+      scope: bigint = domainScopeHash,
+    ): ProofResult {
+      return {
+        name: "exclusion_check_sanctions",
+        proof: buildProofHex([commitmentIn, todayTs, scope, 0n, 0n, 0n, nullifier]),
+        total: 1,
+        committedInputs: {
+          exclusion_check_sanctions: { rootHash: VALID_SANCTIONS_ROOT, isStrict: false },
+        },
+      }
+    }
+
+    test("fails when sanctions proof commitmentIn does not match", async () => {
+      const proofs = [makeSanctionsProof(999n)]
+      const originalQuery: Query = {
+        sanctions: { countries: "all", lists: "all", strict: false },
+      }
+      const queryResult: QueryResult = {
+        sanctions: { passed: true, isStrict: false },
+      }
+
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.sanctions?.commitment).toBeDefined()
+    })
+
+    test("fails when sanctions proof domain scope does not match expected", async () => {
+      const wrongScope = getServiceScopeHash("wrong-domain.com")
+      const proofs = [makeSanctionsProof(commitment, wrongScope)]
+      const originalQuery: Query = {
+        sanctions: { countries: "all", lists: "all", strict: false },
+      }
+      const queryResult: QueryResult = {
+        sanctions: { passed: true, isStrict: false },
+      }
+
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.sanctions?.scope).toBeDefined()
+      expect(queryResultErrors.sanctions!.scope!.message).toContain("different domain")
+    })
+  })
+
+  describe("non-outer proof path - facematch commitment chain and scope", () => {
+    const domain = "example.com"
+    const domainScopeHash = getServiceScopeHash(domain)
+    const todayTs = BigInt(getTodayTimestamp())
+    const commitment = 100n
+
+    function makeFacematchProof(
+      commitmentIn: bigint,
+      scope: bigint = domainScopeHash,
+      subscope: bigint = 0n,
+    ): ProofResult {
+      return {
+        name: "facematch_1234",
+        proof: buildProofHex([commitmentIn, todayTs, scope, subscope, 0n, 0n, 0n]),
+        total: 1,
+        committedInputs: {
+          facematch: {
+            rootKeyLeaf: APPLE_APP_ATTEST_ROOT_KEY_HASH,
+            environment: "production",
+            appIdHash: ZKPASSPORT_IOS_APP_ID_HASH,
+            mode: "regular",
+            integrityPubkeyHash: "0x0",
+          },
+        },
+      }
+    }
+
+    test("fails when facematch proof commitmentIn does not match", async () => {
+      const proofs = [makeFacematchProof(999n)]
+      const originalQuery: Query = { facematch: { mode: "regular" } }
+      const queryResult: QueryResult = {
+        facematch: { mode: "regular", passed: true },
+      }
+
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.facematch?.commitment).toBeDefined()
+    })
+
+    test("fails when facematch proof domain scope does not match expected", async () => {
+      const wrongScope = getServiceScopeHash("wrong-domain.com")
+      const proofs = [makeFacematchProof(commitment, wrongScope)]
+      const originalQuery: Query = { facematch: { mode: "regular" } }
+      const queryResult: QueryResult = {
+        facematch: { mode: "regular", passed: true },
+      }
+
+      const { isCorrect, queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        domain,
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      expect(isCorrect).toBe(false)
+      expect(queryResultErrors.facematch?.scope).toBeDefined()
+      expect(queryResultErrors.facematch!.scope!.message).toContain("different domain")
+    })
+
+    test("skips the domain and scope check when the domain is *", async () => {
+      const proofs = [
+        makeFacematchProof(
+          commitment,
+          getServiceScopeHash("customer.example"),
+          getScopeHash("age-check"),
+        ),
+      ]
+      const originalQuery: Query = { facematch: { mode: "regular" } }
+      const queryResult: QueryResult = {
+        facematch: { mode: "regular", passed: true },
+      }
+
+      const { queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+        "*",
+        proofs,
+        originalQuery,
+        queryResult,
+        86400 * 365,
+      )
+
+      expect(queryResultErrors.facematch?.scope).toBeUndefined()
+    })
+  })
+})
+
+describe("PublicInputChecker - query completeness", () => {
+  const checkQueryCompleteness = (
+    PublicInputChecker as unknown as {
+      checkQueryCompleteness: (
+        originalQuery: Query,
+        committedInputKeys: Set<string>,
+      ) => { isCorrect: boolean; queryResultErrors: Record<string, { commitment?: unknown }> }
+    }
+  ).checkQueryCompleteness.bind(PublicInputChecker)
+
+  const run = (q: Query, keys: string[]) => checkQueryCompleteness(q, new Set(keys))
+
+  test("flags a dropped sanctions condition", () => {
+    const { isCorrect, queryResultErrors } = run(
+      { age: { gte: 18 }, sanctions: {} },
+      ["compare_age"], // sanctions proof omitted
+    )
+    expect(isCorrect).toBe(false)
+    expect(queryResultErrors.sanctions?.commitment).toBeDefined()
+    expect(queryResultErrors.age).toBeUndefined() // age was provided, so not flagged
+  })
+
+  test("passes when every requested condition has a matching proof", () => {
+    const { isCorrect } = run({ age: { gte: 18 }, sanctions: {} }, [
+      "compare_age",
+      "exclusion_check_sanctions",
+    ])
+    expect(isCorrect).toBe(true)
+  })
+
+  test("accepts EVM committed-input variants", () => {
+    const { isCorrect } = run({ age: { gte: 18 } }, ["compare_age_evm"])
+    expect(isCorrect).toBe(true)
+  })
+
+  test("age comparison requires compare_age", () => {
+    expect(run({ age: { gte: 18 } }, []).isCorrect).toBe(false)
+    expect(run({ age: { lt: 65 } }, ["compare_age"]).isCorrect).toBe(true)
+  })
+
+  test("birthdate: comparison needs compare_birthdate, eq/disclose needs disclose_bytes", () => {
+    expect(run({ birthdate: { gte: new Date("2000-01-01") } }, []).isCorrect).toBe(false)
+    expect(
+      run({ birthdate: { gte: new Date("2000-01-01") } }, ["compare_birthdate"]).isCorrect,
+    ).toBe(true)
+    expect(run({ birthdate: { disclose: true } }, ["compare_birthdate"]).isCorrect).toBe(false)
+    expect(run({ birthdate: { disclose: true } }, ["disclose_bytes"]).isCorrect).toBe(true)
+  })
+
+  test("nationality: in, out and eq", () => {
+    expect(run({ nationality: { in: ["FRA"] } }, []).isCorrect).toBe(false)
+    expect(run({ nationality: { in: ["FRA"] } }, ["inclusion_check_nationality"]).isCorrect).toBe(
+      true,
+    )
+    expect(run({ nationality: { out: ["USA"] } }, ["inclusion_check_nationality"]).isCorrect).toBe(
+      false,
+    )
+    expect(run({ nationality: { out: ["USA"] } }, ["exclusion_check_nationality"]).isCorrect).toBe(
+      true,
+    )
+    expect(run({ nationality: { eq: "FRA" } }, ["disclose_bytes"]).isCorrect).toBe(true)
+  })
+
+  test("disclosable fields require disclose_bytes", () => {
+    expect(run({ firstname: { disclose: true } }, []).isCorrect).toBe(false)
+    expect(run({ firstname: { disclose: true } }, ["disclose_bytes"]).isCorrect).toBe(true)
+    expect(run({ document_number: { eq: "X" } }, ["disclose_bytes"]).isCorrect).toBe(true)
+  })
+
+  test("bind and facematch require their circuits", () => {
+    expect(run({ bind: { user_address: "0x0" } }, []).isCorrect).toBe(false)
+    expect(run({ bind: { user_address: "0x0" } }, ["bind"]).isCorrect).toBe(true)
+    expect(run({ facematch: { mode: "regular" } }, []).isCorrect).toBe(false)
+    expect(run({ facematch: { mode: "regular" } }, ["facematch"]).isCorrect).toBe(true)
+  })
+
+  test("an empty query requires nothing", () => {
+    expect(run({}, []).isCorrect).toBe(true)
+  })
+
+  test("flags every dropped condition independently", () => {
+    const { isCorrect, queryResultErrors } = run(
+      { age: { gte: 18 }, sanctions: {}, facematch: { mode: "regular" } },
+      [], // nothing provided
+    )
+    expect(isCorrect).toBe(false)
+    expect(queryResultErrors.age?.commitment).toBeDefined()
+    expect(queryResultErrors.sanctions?.commitment).toBeDefined()
+    expect(queryResultErrors.facematch?.commitment).toBeDefined()
+  })
+
+  test("checkPublicInputs fails when an outer proof drops a requested condition", async () => {
+    const domain = "example.com"
+    const domainScopeHash = getServiceScopeHash(domain)
+    const timestamp = BigInt(getTodayTimestamp())
+    const proofs: ProofResult[] = [
+      {
+        name: "outer_4",
+        proof: buildProofHex([1n, 2n, timestamp, domainScopeHash, 0n, 0n, 0n, 42n]),
+        total: 1,
+        committedInputs: {},
+      },
+    ]
+
+    const { isCorrect, queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+      domain,
+      proofs,
+      { sanctions: {} }, // originalQuery
+      {},
+      86400 * 365,
+    )
+
+    expect(isCorrect).toBe(false)
+    expect(queryResultErrors.sanctions?.commitment?.message).toContain("sanctions exclusion")
+  })
+})
+
+// The app reports "DEU" for the MRZ code "D<<", so the checker must parse it the same way
+describe("PublicInputChecker - German documents (D<< country code)", () => {
+  const germanPassportMRZ =
+    "P<D<<MUSTERMANN<<ERIKA<<<<<<<<<<<<<<<<<<<<<<C01X00T478D<<6408125F2702283<<<<<<<<<<<<<<<4"
+  const germanIDCardMRZ =
+    "IDD<<L01X00T471<<<<<<<<<<<<<<<6408125F2702283D<<<<<<<<<<<<<4MUSTERMANN<<ERIKA<<<<<<<<<<<<<"
+
+  const makeDiscloseProofFromMrz = (mrz: string, ...ranges: [number, number][]) => {
+    const mask = new Array(90).fill(0)
+    for (const [start, end] of ranges) mask.fill(1, start, end)
+    return makeDiscloseProof(getDisclosedBytesFromMrzAndMask(mrz, mask))
+  }
+
+  describe("passports (TD3)", () => {
+    test("nationality disclose accepts DEU", () => {
+      const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+        makeDiscloseProofFromMrz(germanPassportMRZ, [54, 57]),
+        { nationality: { disclose: true } },
+        { nationality: { disclose: { result: "DEU" } } },
+      )
+      expect(queryResultErrors.nationality).toBeUndefined()
+    })
+
+    test("issuing_country disclose accepts DEU", () => {
+      const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+        makeDiscloseProofFromMrz(germanPassportMRZ, [2, 5]),
+        { issuing_country: { disclose: true } },
+        { issuing_country: { disclose: { result: "DEU" } } },
+      )
+      expect(queryResultErrors.issuing_country).toBeUndefined()
+    })
+
+    test("nationality eq accepts DEU", () => {
+      const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+        makeDiscloseProofFromMrz(germanPassportMRZ, [54, 57]),
+        { nationality: { eq: "DEU" } },
+        { nationality: { eq: { expected: "DEU", result: true } } },
+      )
+      expect(queryResultErrors.nationality).toBeUndefined()
+    })
+
+    test("issuing_country eq accepts DEU", () => {
+      const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+        makeDiscloseProofFromMrz(germanPassportMRZ, [2, 5]),
+        { issuing_country: { eq: "DEU" } },
+        { issuing_country: { eq: { expected: "DEU", result: true } } },
+      )
+      expect(queryResultErrors.issuing_country).toBeUndefined()
+    })
+
+    test("still rejects a nationality the passport does not hold", () => {
+      const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+        makeDiscloseProofFromMrz(germanPassportMRZ, [54, 57]),
+        { nationality: { disclose: true } },
+        { nationality: { disclose: { result: "FRA" } } },
+      )
+      expect(queryResultErrors.nationality?.disclose).toBeDefined()
+    })
+
+    test("the reported query passes end to end", () => {
+      const { isCorrect } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+        makeDiscloseProofFromMrz(germanPassportMRZ, [5, 44], [54, 57], [57, 63]),
+        {
+          firstname: { disclose: true },
+          lastname: { disclose: true },
+          birthdate: { disclose: true },
+          nationality: { disclose: true },
+        },
+        {
+          firstname: { disclose: { result: "ERIKA" } },
+          lastname: { disclose: { result: "MUSTERMANN" } },
+          birthdate: { disclose: { result: new Date(Date.UTC(1964, 7, 12)) } },
+          nationality: { disclose: { result: "DEU" } },
+        },
+      )
+      expect(isCorrect).toBe(true)
+    })
+  })
+
+  describe("id cards (TD1)", () => {
+    test("nationality disclose accepts DEU", () => {
+      const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+        makeDiscloseProofFromMrz(germanIDCardMRZ, [45, 48]),
+        { nationality: { disclose: true } },
+        { nationality: { disclose: { result: "DEU" } } },
+      )
+      expect(queryResultErrors.nationality).toBeUndefined()
+    })
+
+    test("issuing_country disclose accepts DEU", () => {
+      const { queryResultErrors } = PublicInputChecker.checkDiscloseBytesPublicInputs(
+        makeDiscloseProofFromMrz(germanIDCardMRZ, [2, 5]),
+        { issuing_country: { disclose: true } },
+        { issuing_country: { disclose: { result: "DEU" } } },
+      )
+      expect(queryResultErrors.issuing_country).toBeUndefined()
+    })
+  })
+})
+
+describe("PublicInputChecker - registry chain", () => {
+  const certificateRoot = "0x" + "cd".repeat(32)
+  let certificateRootValidity: ReturnType<typeof spyOn>
+
+  // Makes every certificate root valid on the registries of the given chains only
+  function mockCertificateRootValidOn(...chains: SupportedChain[]) {
+    const chainIds = chains.map(getIdFromChain)
+    certificateRootValidity = spyOn(
+      RegistryClient.prototype,
+      "isCertificateRootValid",
+    ).mockImplementation(async function (this: RegistryClient) {
+      return chainIds.includes((this as unknown as { chainId: number }).chainId)
+    })
+  }
+
+  async function isCertificateRootAccepted(query: Query, devMode: boolean) {
+    const { isCorrect } = await PublicInputChecker.checkCertificateRegistryRoot(
+      certificateRoot,
+      {},
+      false,
+      devMode,
+      undefined,
+      query,
+    )
+    return isCorrect
+  }
+
+  afterEach(() => {
+    certificateRootValidity.mockRestore()
+  })
+
+  test("accepts a root valid on the query's bound chain", async () => {
+    mockCertificateRootValidOn("ethereum_sepolia")
+
+    expect(await isCertificateRootAccepted({ bind: { chain: "ethereum_sepolia" } }, false)).toBe(
+      true,
+    )
+  })
+
+  test("rejects a root valid only on another chain than the query's bound chain", async () => {
+    mockCertificateRootValidOn("ethereum")
+
+    expect(await isCertificateRootAccepted({ bind: { chain: "ethereum_sepolia" } }, false)).toBe(
+      false,
+    )
+  })
+
+  test("rejects a query bound to a chain without a registry", async () => {
+    mockCertificateRootValidOn("ethereum")
+
+    expect(await isCertificateRootAccepted({ bind: { chain: "arbitrum" } }, false)).toBe(false)
+  })
+
+  test("checks an unbound query on Sepolia in dev mode and on Ethereum otherwise", async () => {
+    mockCertificateRootValidOn("ethereum_sepolia")
+
+    expect(await isCertificateRootAccepted({}, true)).toBe(true)
+    expect(await isCertificateRootAccepted({}, false)).toBe(false)
+  })
+})
+
+describe("PublicInputChecker - sanctions registry chain", () => {
+  const sanctionsRoot = "0x" + "ef".repeat(32)
+  let sanctionsRootValidity: ReturnType<typeof spyOn>
+
+  // Makes every sanctions root valid on the registries of the given chains only
+  function mockSanctionsRootValidOn(...chains: SupportedChain[]) {
+    const chainIds = chains.map(getIdFromChain)
+    sanctionsRootValidity = spyOn(
+      RegistryClient.prototype,
+      "isSanctionsRootValid",
+    ).mockImplementation(async function (this: RegistryClient) {
+      return chainIds.includes((this as unknown as { chainId: number }).chainId)
+    })
+  }
+
+  async function isSanctionsRootAccepted(boundChain: SupportedChain) {
+    const { isCorrect } = await PublicInputChecker.checkSanctionsExclusionPublicInputs(
+      { sanctions: { countries: "all", lists: "all", strict: false }, bind: { chain: boundChain } },
+      { sanctions: { passed: true, isStrict: false } },
+      { rootHash: sanctionsRoot, isStrict: false },
+    )
+    return isCorrect
+  }
+
+  afterEach(() => {
+    sanctionsRootValidity.mockRestore()
+  })
+
+  test("accepts a sanctions root valid on the query's bound chain", async () => {
+    mockSanctionsRootValidOn("base")
+
+    expect(await isSanctionsRootAccepted("base")).toBe(true)
+  })
+
+  test("rejects a sanctions root valid only on another chain than the query's bound chain", async () => {
+    mockSanctionsRootValidOn("ethereum")
+
+    expect(await isSanctionsRootAccepted("base")).toBe(false)
+  })
+})
+
+describe("PublicInputChecker - registry root checks with a supplied client", () => {
+  let originalFetch: typeof globalThis.fetch
+  let originalWarn: typeof console.warn
+
+  // Records the roots it is asked about and accepts them all
+  class StubRegistryClient extends RegistryClient {
+    checkedRoots: string[] = []
+
+    constructor() {
+      super({ chainId: 1 })
+    }
+
+    override async isCertificateRootValid(root: string): Promise<boolean> {
+      this.checkedRoots.push(root)
+      return true
+    }
+
+    override async isCircuitRootValid(root: string): Promise<boolean> {
+      this.checkedRoots.push(root)
+      return true
+    }
+
+    override async isSanctionsRootValid(root: string): Promise<boolean> {
+      this.checkedRoots.push(root)
+      return true
+    }
+  }
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch
+    originalWarn = console.warn
+    console.warn = () => {}
+    // Any request reaching a default client fails without touching the network
+    globalThis.fetch = (async () =>
+      Response.json({ error: { message: "unreachable in tests" } })) as unknown as typeof fetch
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    console.warn = originalWarn
+  })
+
+  test("checkCertificateRegistryRoot uses the supplied client", async () => {
+    const client = new StubRegistryClient()
+    const { isCorrect, queryResultErrors } = await PublicInputChecker.checkCertificateRegistryRoot(
+      "abc",
+      {},
+      false,
+      false,
+      undefined,
+      {},
+      client,
+    )
+    expect(isCorrect).toBe(true)
+    expect(queryResultErrors).toEqual({})
+    expect(client.checkedRoots).toEqual(["abc"])
+  })
+
+  test("checkCircuitRegistryRoot uses the supplied client", async () => {
+    const client = new StubRegistryClient()
+    const { isCorrect, queryResultErrors } = await PublicInputChecker.checkCircuitRegistryRoot(
+      "def",
+      {},
+      false,
+      undefined,
+      {},
+      client,
+    )
+    expect(isCorrect).toBe(true)
+    expect(queryResultErrors).toEqual({})
+    expect(client.checkedRoots).toEqual(["def"])
+  })
+
+  test("checkSanctionsExclusionPublicInputs uses the supplied client", async () => {
+    const client = new StubRegistryClient()
+    const { isCorrect } = await PublicInputChecker.checkSanctionsExclusionPublicInputs(
+      { sanctions: { countries: "all", lists: "all", strict: false } },
+      { sanctions: { passed: true, isStrict: false } },
+      { rootHash: "0x" + "ef".repeat(32), isStrict: false },
+      false,
+      undefined,
+      client,
+    )
+    expect(isCorrect).toBe(true)
+    expect(client.checkedRoots).toEqual(["0x" + "ef".repeat(32)])
+  })
+
+  test("falls back to a default client when none is supplied", async () => {
+    const { isCorrect, queryResultErrors } = await PublicInputChecker.checkCertificateRegistryRoot(
+      "abc",
+      {},
+      false,
+      false,
+    )
+    expect(isCorrect).toBe(false)
+    expect(queryResultErrors.sig_check_dsc.certificate.received).toBe(
+      "Got invalid certificate registry root: abc",
+    )
+  })
+
+  test("checkPublicInputs forwards the client to the root checks", async () => {
+    const domain = "example.com"
+    const todayTs = BigInt(getTodayTimestamp())
+    const paramCommitment = await getAgeParameterCommitment(18, 0)
+    const proofs: ProofResult[] = [
+      { name: "sig_check_dsc_1234", proof: buildProofHex([1n, 111n]), total: 5 },
+      { name: "sig_check_id_data_1234", proof: buildProofHex([111n, 222n]), total: 5 },
+      { name: "data_check_integrity_1234", proof: buildProofHex([222n, 333n]), total: 5 },
+      {
+        name: "compare_age",
+        proof: buildProofHex([
+          333n,
+          todayTs,
+          getServiceScopeHash(domain),
+          0n,
+          paramCommitment,
+          0n,
+          999n,
+        ]),
+        total: 5,
+        committedInputs: { compare_age: { minAge: 18, maxAge: 0 } },
+      },
+    ]
+    const originalQuery: Query = { age: { gte: 18 } }
+    const queryResult: QueryResult = { age: { gte: { expected: 18, result: true } } }
+
+    const client = new StubRegistryClient()
+    const withClient = await PublicInputChecker.checkPublicInputs(
+      domain,
+      proofs,
+      originalQuery,
+      queryResult,
+      86400 * 365,
+      undefined,
+      undefined,
+      false,
+      client,
+    )
+    expect(withClient.isCorrect).toBe(true)
+    expect(client.checkedRoots).toEqual(["1"])
+
+    const withoutClient = await PublicInputChecker.checkPublicInputs(
+      domain,
+      proofs,
+      originalQuery,
+      queryResult,
+      86400 * 365,
+    )
+    expect(withoutClient.isCorrect).toBe(false)
+    expect(withoutClient.queryResultErrors.sig_check_dsc?.certificate).toBeDefined()
+  })
+
+  test("checkPublicInputs forwards the client to the root check of a standalone sanctions proof", async () => {
+    const domain = "example.com"
+    const todayTs = BigInt(getTodayTimestamp())
+    const sanctionsRoot = "0x" + "0e".repeat(32)
+    const paramCommitment = await getSanctionsParameterCommitment(sanctionsRoot, true)
+    const proofs: ProofResult[] = [
+      { name: "sig_check_dsc_1234", proof: buildProofHex([1n, 111n]), total: 5 },
+      { name: "sig_check_id_data_1234", proof: buildProofHex([111n, 222n]), total: 5 },
+      { name: "data_check_integrity_1234", proof: buildProofHex([222n, 333n]), total: 5 },
+      {
+        name: "exclusion_check_sanctions",
+        proof: buildProofHex([
+          333n,
+          todayTs,
+          getServiceScopeHash(domain),
+          0n,
+          paramCommitment,
+          0n,
+          999n,
+        ]),
+        total: 5,
+        committedInputs: {
+          exclusion_check_sanctions: { rootHash: sanctionsRoot, isStrict: true },
+        },
+      },
+    ]
+    const originalQuery: Query = { sanctions: { countries: "all", lists: "all", strict: true } }
+    const queryResult: QueryResult = { sanctions: { passed: true, isStrict: true } }
+
+    const client = new StubRegistryClient()
+    const { isCorrect, queryResultErrors } = await PublicInputChecker.checkPublicInputs(
+      domain,
+      proofs,
+      originalQuery,
+      queryResult,
+      86400 * 365,
+      undefined,
+      undefined,
+      false,
+      client,
+    )
+    expect(queryResultErrors).toEqual({})
+    expect(isCorrect).toBe(true)
+    expect(client.checkedRoots).toContain(sanctionsRoot)
+  })
+})

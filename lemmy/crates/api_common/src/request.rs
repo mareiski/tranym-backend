@@ -1,0 +1,933 @@
+use crate::{
+  context::LemmyContext,
+  lemmy_db_schema::traits::Crud,
+  post::{LinkMetadata, OpenGraphData},
+  send_activity::{ActivityChannel, SendActivityData},
+  utils::{local_site_opt_to_sensitive, proxy_image_link},
+};
+use activitypub_federation::config::Data;
+use chrono::{DateTime, Utc};
+use encoding_rs::{Encoding, UTF_8};
+use futures::StreamExt;
+use hyper::client::connect::dns::Name;
+use lemmy_db_schema::{
+  newtypes::DbUrl,
+  source::{
+    images::{ImageDetailsForm, LocalImage, LocalImageForm},
+    local_site::LocalSite,
+    local_user::LocalUser,
+    post::{Post, PostUpdateForm},
+  },
+};
+use lemmy_utils::{
+  error::{LemmyError, LemmyErrorExt, LemmyErrorType, LemmyResult},
+  settings::structs::{PictrsImageMode, Settings},
+  REQWEST_TIMEOUT,
+  VERSION,
+};
+use mime::{Mime, TEXT_HTML};
+use reqwest::{
+  dns::{Addrs, Resolve, Resolving},
+  header::{CONTENT_TYPE, LOCATION, RANGE},
+  redirect::Policy,
+  Client,
+  ClientBuilder,
+  Response,
+};
+use reqwest_middleware::ClientWithMiddleware;
+use serde::{Deserialize, Serialize};
+use std::{
+  env,
+  io,
+  net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+  sync::Arc,
+};
+use tokio::net::lookup_host;
+use tracing::{info, warn};
+use url::{Host, Url};
+use urlencoding::encode;
+use webpage::HTML;
+
+pub fn client_builder(settings: &Settings) -> ClientBuilder {
+  let user_agent = format!("Lemmy/{VERSION}; +{}", settings.get_protocol_and_hostname());
+
+  Client::builder()
+    .user_agent(user_agent.clone())
+    .timeout(REQWEST_TIMEOUT)
+    .connect_timeout(REQWEST_TIMEOUT)
+    // Workaround for https://github.com/LemmyNet/lemmy/issues/5742
+    .http1_only()
+    .redirect(Policy::none())
+    // Validate resolved IPs on every connection to prevent SSRF and DNS rebinding attacks.
+    .dns_resolver(Arc::new(ValidatingDnsResolver::new(settings)))
+}
+
+/// DNS resolver which rejects hostnames that resolve to internal IPs.
+///
+/// Attached to the reqwest client, so that IP validation happens at the exact moment of
+/// connecting. This way attackers-controlled domain can't bypass the check with IP rebind.
+struct ValidatingDnsResolver {
+  settings: Settings,
+}
+
+impl ValidatingDnsResolver {
+  fn new(settings: &Settings) -> Self {
+    Self {
+      settings: settings.clone(),
+    }
+  }
+}
+
+impl Resolve for ValidatingDnsResolver {
+  fn resolve(&self, name: Name) -> Resolving {
+    let host = name.as_str().trim_end_matches('.').to_owned();
+    let settings = self.settings.clone();
+    Box::pin(async move {
+      // Resolver has no access to port, so allowlisted hosts are matched by name only.
+      let addrs = resolve_and_validate_host(&host, None, &settings).await?;
+      let addrs: Addrs = Box::new(addrs.into_iter());
+      Ok(addrs)
+    })
+  }
+}
+
+/// Allow access to local Lemmy instance and internal pict-rs
+fn allow_hosts(settings: &Settings) -> Vec<(String, u16)> {
+  let mut allow_hosts = vec![];
+  if let Ok(url) = settings.get_protocol_and_hostname().parse::<Url>() {
+    if let Some(host) = url.host_str() {
+      allow_hosts.push((
+        normalize_host(host),
+        url.port_or_known_default().unwrap_or(443),
+      ));
+    }
+  }
+  if let Ok(pictrs) = settings.pictrs_config() {
+    if let Some(host) = pictrs.url.host_str() {
+      allow_hosts.push((
+        normalize_host(host),
+        pictrs.url.port_or_known_default().unwrap_or(8080),
+      ));
+    }
+  }
+  allow_hosts
+}
+
+/// Resolve the given hostname (or IP literal) and return the resolved addresses, so they can be
+/// used directly for connecting. Must return io::Result for `impl Resolve`.
+async fn resolve_and_validate_host(
+  host: &str,
+  port: Option<u16>,
+  settings: &Settings,
+) -> io::Result<Vec<SocketAddr>> {
+  let host = normalize_host(host);
+  // Port is only used to construct SocketAddr, which is later discarded.
+  let default_port = port.unwrap_or(0);
+  // Parse host as plain IP, otherwise resolve domain via DNS
+  let addrs: Vec<SocketAddr> = match host.parse::<IpAddr>() {
+    Ok(ip) => vec![SocketAddr::new(ip.to_canonical(), default_port)],
+    Err(_) => lookup_host((host.as_str(), default_port)).await?.collect(),
+  };
+
+  let is_allowed_host = allow_hosts(settings)
+    .iter()
+    .any(|(allowed_host, allowed_port)| {
+      allowed_host == &host && (port.is_none() || Some(allowed_port) == port.as_ref())
+    });
+
+  if cfg!(debug_assertions)
+    || env::var("DANGER_FEDERATION_ALLOW_LOCAL_IP").is_ok()
+    || is_allowed_host
+  {
+    return Ok(addrs);
+  }
+
+  if let Some(ip) = addrs
+    .iter()
+    .map(|a| a.ip().to_canonical())
+    .find(|ip| match ip {
+      IpAddr::V4(ipv4) => v4_is_invalid(*ipv4),
+      IpAddr::V6(ipv6) => v6_is_invalid(*ipv6),
+    })
+  {
+    return Err(io::Error::other(format!(
+      "Hostname {host} resolves to internal IP {ip}. This may indicate an attacker attempting to access internal services. If intentional, you can ignore this error by setting DANGER_FEDERATION_ALLOW_LOCAL_IP=1"
+    )));
+  }
+  Ok(addrs)
+}
+
+/// Strips trailing dot and port from a hostname, lowercases it. Preserves bare IPv6 addresses.
+fn normalize_host(host: &str) -> String {
+  let host = host.trim_end_matches('.').to_ascii_lowercase();
+  if let Some(stripped) = host.strip_prefix('[') {
+    if let Some((ipv6, _)) = stripped.split_once(']') {
+      return ipv6.to_owned();
+    }
+  }
+  // An IPv6 address contains multiple colons, dont strip anything in that case.
+  if host.matches(':').count() > 1 {
+    return host;
+  }
+  host.split(':').next().unwrap_or(&host).to_owned()
+}
+
+/// Fetches metadata for the given link and optionally generates thumbnail.
+#[tracing::instrument(skip_all)]
+pub async fn fetch_link_metadata(
+  url: &Url,
+  context: &LemmyContext,
+  recursion: bool,
+) -> LemmyResult<LinkMetadata> {
+  if url.scheme() != "http" && url.scheme() != "https" {
+    return Err(LemmyErrorType::InvalidUrl.into());
+  }
+
+  validate_link_ip(url, context.settings()).await?;
+  info!("Fetching site metadata for url: {}", url);
+  // We only fetch the first MB of data in order to not waste bandwidth especially for large
+  // binary files. This high limit is particularly needed for youtube, which includes a lot of
+  // javascript code before the opengraph tags. Mastodon also uses a 1 MB limit:
+  // https://github.com/mastodon/mastodon/blob/295ad6f19a016b3f16e1201ffcbb1b3ad6b455a2/app/lib/request.rb#L213
+  let bytes_to_fetch = 1024 * 1024;
+  let response = context
+    .client()
+    .get(url.as_str())
+    // we only need the first chunk of data. Note that we do not check for Accept-Range so the
+    // server may ignore this and still respond with the full response
+    .header(RANGE, format!("bytes=0-{}", bytes_to_fetch - 1)) /* -1 because inclusive */
+    .send()
+    .await?;
+
+  // Manually follow one redirect, using internal IP check. Further redirects are ignored.
+  let location = response
+    .headers()
+    .get(LOCATION)
+    .and_then(|l| l.to_str().ok());
+  if let (Some(location), false) = (location, recursion) {
+    let url = location.parse()?;
+    return Box::pin(fetch_link_metadata(&url, context, true)).await;
+  }
+
+  let mut content_type: Option<Mime> = response
+    .headers()
+    .get(CONTENT_TYPE)
+    .and_then(|h| h.to_str().ok())
+    .and_then(|h| h.parse().ok())
+    // If we don't get a content_type from the response (e.g. if the server is down),
+    // then try to infer the content_type from the file extension.
+    .or(mime_guess::from_path(url.path()).first());
+
+  let opengraph_data = {
+    let is_html = content_type
+      .as_ref()
+      .map(|c| {
+        // application/xhtml+xml is a subset of HTML
+        let application_xhtml: Mime = "application/xhtml+xml".parse::<Mime>().unwrap_or(TEXT_HTML);
+        let allowed_mime_types = [TEXT_HTML.essence_str(), application_xhtml.essence_str()];
+        allowed_mime_types.contains(&c.essence_str())
+      })
+      .unwrap_or_default();
+
+    if is_html {
+      // Can't use .text() here, because it only checks the content header, not the actual bytes
+      // https://github.com/LemmyNet/lemmy/issues/1964
+      // So we want to do deep inspection of the actually returned bytes but need to be careful
+      // not spend too much time parsing binary data as HTML
+      // only take first bytes regardless of how many bytes the server returns
+      let html_bytes = collect_bytes_until_limit(response, bytes_to_fetch).await?;
+      extract_opengraph_data(&html_bytes, url)
+        .map_err(|e| info!("{e}"))
+        .unwrap_or_default()
+    } else {
+      let is_octet_type = content_type
+        .as_ref()
+        .map(|c| c.subtype() == "octet-stream")
+        .unwrap_or_default();
+
+      // Overwrite the content type if its an octet type
+      if is_octet_type {
+        // Don't need to fetch as much data for this as we do with opengraph
+        let octet_bytes = collect_bytes_until_limit(response, 512).await?;
+        content_type =
+          infer::get(&octet_bytes).map_or(content_type, |t| t.mime_type().parse().ok());
+      }
+
+      Default::default()
+    }
+  };
+
+  Ok(LinkMetadata {
+    opengraph_data,
+    content_type: content_type.map(|c| c.to_string()),
+  })
+}
+
+/// Throw an error if the link points to an internal IP, either as literal IP or as domain which
+/// resolves to an internal IP.
+pub async fn validate_link_ip(url: &Url, settings: &Settings) -> LemmyResult<()> {
+  let host = match url.host().ok_or(LemmyErrorType::UrlWithoutDomain)? {
+    Host::Domain(domain) => domain.to_owned(),
+    Host::Ipv4(ipv4) => ipv4.to_string(),
+    Host::Ipv6(ipv6) => ipv6.to_string(),
+  };
+  resolve_and_validate_host(&host, url.port_or_known_default(), settings)
+    .await
+    .with_lemmy_type(LemmyErrorType::InvalidUrl)?;
+  Ok(())
+}
+
+/// Checks if the address is in a non-global range, mirroring
+/// `std::net::Ipv4Addr::is_global()` (unstable, see https://github.com/rust-lang/rust/issues/27709).
+/// Ranges which cannot connect to internal services (e.g. IETF protocol assignments,
+/// benchmarking) are not checked.
+fn v4_is_invalid(v4: Ipv4Addr) -> bool {
+  let octets = v4.octets();
+  v4.is_private()
+    || v4.is_loopback()
+    || v4.is_link_local()
+    || v4.is_multicast()
+    || v4.is_documentation()
+    || v4.is_unspecified()
+    || v4.is_broadcast()
+    // 0.0.0.0/8: connecting to 0.x.x.x reaches loopback on Linux
+    || octets[0] == 0
+    // 100.64.0.0/10: shared address space (CGNAT), used for internal services by cloud providers
+    || (octets[0] == 100 && (octets[1] & 0xc0) == 0x40)
+    || octets[0] >= 240 // reserved 240.0.0.0/4
+}
+
+/// Checks if the address is in a non-global range, mirroring
+/// `std::net::Ipv6Addr::is_global()` (unstable, see https://github.com/rust-lang/rust/issues/27709).
+/// Ranges which cannot connect to internal services (e.g. Teredo, discard-only)
+/// are not checked.
+fn v6_is_invalid(v6: Ipv6Addr) -> bool {
+  let segments = v6.segments();
+  // NAT64 well-known prefix (64:ff9b::/96) embeds an IPv4 address in the low 32 bits.
+  if matches!(segments, [0x64, 0xff9b, 0, 0, 0, 0, ..]) {
+    let [a, b] = segments[6].to_be_bytes();
+    let [c, d] = segments[7].to_be_bytes();
+    return v4_is_invalid(Ipv4Addr::from([a, b, c, d]));
+  }
+  matches!(
+    segments,
+    // documentation (2001:db8::/32, 3fff::/20)
+    [0x2001, 0xdb8, ..] | [0x3fff, 0..=0x0fff, ..]
+    // IPv4-compatible (::/96, deprecated) and IPv4-mapped (::ffff:0:0/96)
+    | [0, 0, 0, 0, 0, 0, ..]
+    | [0, 0, 0, 0, 0, 0xffff, ..]
+    // local-use NAT64 prefix (64:ff9b:1::/48)
+    | [0x64, 0xff9b, 1, ..]
+    // 6to4 (2002::/16, deprecated)
+    | [0x2002, ..]
+  ) || v6.is_loopback()
+    || v6.is_multicast()
+    || (segments[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
+    || (segments[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+    || v6.is_unspecified()
+}
+
+async fn collect_bytes_until_limit(
+  response: Response,
+  requested_bytes: usize,
+) -> Result<Vec<u8>, LemmyError> {
+  let mut stream = response.bytes_stream();
+  let mut bytes = Vec::with_capacity(requested_bytes);
+  while let Some(chunk) = stream.next().await {
+    let chunk = chunk.map_err(LemmyError::from)?;
+    // we may go over the requested size here but the important part is we don't keep aggregating
+    // more chunks than needed
+    bytes.extend_from_slice(&chunk);
+    if bytes.len() >= requested_bytes {
+      bytes.truncate(requested_bytes);
+      break;
+    }
+  }
+  Ok(bytes)
+}
+
+/// Generates and saves a post thumbnail and metadata.
+///
+/// Takes a callback to generate a send activity task, so that post can be federated with metadata.
+///
+/// TODO: `federated_thumbnail` param can be removed once we federate full metadata and can
+///       write it to db directly, without calling this function.
+///       https://github.com/LemmyNet/lemmy/issues/4598
+pub async fn generate_post_link_metadata(
+  post: Post,
+  custom_thumbnail: Option<Url>,
+  send_activity: impl FnOnce(Post) -> Option<SendActivityData> + Send + 'static,
+  local_site: Option<LocalSite>,
+  context: Data<LemmyContext>,
+) -> LemmyResult<()> {
+  let metadata = match &post.url {
+    Some(url) => fetch_link_metadata(url, &context, false)
+      .await
+      .unwrap_or_default(),
+    _ => Default::default(),
+  };
+
+  let is_image_post = metadata
+    .content_type
+    .as_ref()
+    .is_some_and(|content_type| content_type.starts_with("image"));
+
+  // Decide if we are allowed to generate local thumbnail
+  let allow_sensitive = local_site_opt_to_sensitive(&local_site);
+  let allow_generate_thumbnail = allow_sensitive || !post.nsfw;
+
+  // Proxy the post url itself if it is an image
+  let url = if let (true, Some(url)) = (is_image_post, post.url.clone()) {
+    Some(Some(proxy_image_link(url.into(), &context).await?))
+  } else {
+    None
+  };
+
+  let image_url = if is_image_post {
+    post.url
+  } else {
+    metadata.opengraph_data.image.clone()
+  };
+
+  // Attempt to generate a thumbnail depending on the instance settings. Either by proxying,
+  // storing image persistently in pict-rs or returning the remote url directly as thumbnail.
+  let thumbnail_url = if let (false, Some(url)) = (is_image_post, custom_thumbnail) {
+    proxy_image_link(url.clone(), &context)
+      .await
+      .map_err(|e| warn!("Failed to proxy thumbnail: {e}"))
+      .ok()
+      .or(Some(url.into()))
+  } else if let (true, Some(url)) = (allow_generate_thumbnail, image_url.clone()) {
+    generate_pictrs_thumbnail(&url, &context)
+      .await
+      .map_err(|e| warn!("Failed to generate thumbnail: {e}"))
+      .ok()
+      .map(Into::into)
+      .or(image_url)
+  } else {
+    image_url.clone()
+  };
+
+  let form = PostUpdateForm {
+    url,
+    embed_title: Some(metadata.opengraph_data.title),
+    embed_description: Some(metadata.opengraph_data.description),
+    embed_video_url: Some(metadata.opengraph_data.embed_video_url),
+    thumbnail_url: Some(thumbnail_url),
+    url_content_type: Some(metadata.content_type),
+    ..Default::default()
+  };
+  let updated_post = Post::update(&mut context.pool(), post.id, &form).await?;
+  if let Some(send_activity) = send_activity(updated_post) {
+    ActivityChannel::submit_activity(send_activity, &context).await?;
+  }
+  Ok(())
+}
+
+/// Extract site metadata from HTML Opengraph attributes.
+fn extract_opengraph_data(html_bytes: &[u8], url: &Url) -> LemmyResult<OpenGraphData> {
+  let html = String::from_utf8_lossy(html_bytes);
+
+  let mut page = HTML::from_string(html.to_string(), None)?;
+
+  // If the web page specifies that it isn't actually UTF-8, re-decode the received bytes with the
+  // proper encoding. If the specified encoding cannot be found, fall back to the original UTF-8
+  // version.
+  if let Some(charset) = page.meta.get("charset") {
+    if charset != UTF_8.name() {
+      if let Some(encoding) = Encoding::for_label(charset.as_bytes()) {
+        page = HTML::from_string(encoding.decode(html_bytes).0.into(), None)?;
+      }
+    }
+  }
+
+  let page_title = page.title;
+  let page_description = page.description;
+
+  let og_description = page
+    .opengraph
+    .properties
+    .get("description")
+    .map(std::string::ToString::to_string);
+  let og_title = page
+    .opengraph
+    .properties
+    .get("title")
+    .map(std::string::ToString::to_string);
+  let og_image = page
+    .opengraph
+    .images
+    .first()
+    // join also works if the target URL is absolute
+    .and_then(|ogo| url.join(&ogo.url).ok());
+  let og_embed_url = page
+    .opengraph
+    .videos
+    .first()
+    // join also works if the target URL is absolute
+    .and_then(|v| url.join(&v.url).ok());
+
+  Ok(OpenGraphData {
+    title: og_title.or(page_title),
+    description: og_description.or(page_description),
+    image: og_image.map(Into::into),
+    embed_video_url: og_embed_url.map(Into::into),
+  })
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct PictrsResponse {
+  pub files: Option<Vec<PictrsFile>>,
+  pub msg: String,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct PictrsFile {
+  pub file: String,
+  pub delete_token: String,
+  pub details: PictrsFileDetails,
+}
+
+impl PictrsFile {
+  pub fn thumbnail_url(&self, protocol_and_hostname: &str) -> Result<Url, url::ParseError> {
+    Url::parse(&format!(
+      "{protocol_and_hostname}/pictrs/image/{}",
+      self.file
+    ))
+  }
+}
+
+/// Stores extra details about a Pictrs image.
+#[derive(Deserialize, Serialize, Debug)]
+pub struct PictrsFileDetails {
+  /// In pixels
+  pub width: u16,
+  /// In pixels
+  pub height: u16,
+  pub content_type: String,
+  pub created_at: DateTime<Utc>,
+}
+
+impl PictrsFileDetails {
+  /// Builds the image form. This should always use the thumbnail_url,
+  /// Because the post_view joins to it
+  pub fn build_image_details_form(&self, thumbnail_url: &Url) -> ImageDetailsForm {
+    ImageDetailsForm {
+      link: thumbnail_url.clone().into(),
+      width: self.width.into(),
+      height: self.height.into(),
+      content_type: self.content_type.clone(),
+    }
+  }
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+struct PictrsPurgeResponse {
+  msg: String,
+}
+
+/// Purges an image from pictrs
+/// Note: This should often be coerced from a Result to .ok() in order to fail softly, because:
+/// - It might fail due to image being not local
+/// - It might not be an image
+/// - Pictrs might not be set up
+pub async fn purge_image_from_pictrs(image_url: &Url, context: &LemmyContext) -> LemmyResult<()> {
+  validate_link_ip(image_url, context.settings()).await?;
+  is_image_content_type(context.client(), image_url).await?;
+
+  let alias = image_url
+    .path_segments()
+    .ok_or(LemmyErrorType::ImageUrlMissingPathSegments)?
+    .next_back()
+    .ok_or(LemmyErrorType::ImageUrlMissingLastPathSegment)?;
+
+  let pictrs_config = context.settings().pictrs_config()?;
+  let purge_url = format!("{}internal/purge?alias={}", pictrs_config.url, alias);
+
+  let pictrs_api_key = pictrs_config
+    .api_key
+    .ok_or(LemmyErrorType::PictrsApiKeyNotProvided)?;
+  let response = context
+    .client()
+    .post(&purge_url)
+    .timeout(REQWEST_TIMEOUT)
+    .header("x-api-token", pictrs_api_key)
+    .send()
+    .await?;
+
+  let response: PictrsPurgeResponse = response.json().await.map_err(LemmyError::from)?;
+
+  match response.msg.as_str() {
+    "ok" => Ok(()),
+    _ => Err(LemmyErrorType::PictrsPurgeResponseError(response.msg))?,
+  }
+}
+
+pub async fn delete_image_from_pictrs(
+  alias: &str,
+  delete_token: &str,
+  context: &LemmyContext,
+) -> LemmyResult<()> {
+  let pictrs_config = context.settings().pictrs_config()?;
+  let url = format!(
+    "{}image/delete/{}/{}",
+    pictrs_config.url, &delete_token, &alias
+  );
+  context
+    .client()
+    .delete(&url)
+    .timeout(REQWEST_TIMEOUT)
+    .send()
+    .await
+    .map_err(LemmyError::from)?;
+  Ok(())
+}
+
+/// Retrieves the image with local pict-rs and generates a thumbnail. Returns the thumbnail url.
+#[tracing::instrument(skip_all)]
+async fn generate_pictrs_thumbnail(image_url: &Url, context: &LemmyContext) -> LemmyResult<Url> {
+  validate_link_ip(image_url, context.settings()).await?;
+  let pictrs_config = context.settings().pictrs_config()?;
+
+  match pictrs_config.image_mode() {
+    PictrsImageMode::None => return Ok(image_url.clone()),
+    PictrsImageMode::ProxyAllImages => {
+      return Ok(proxy_image_link(image_url.clone(), context).await?.into())
+    }
+    _ => {}
+  };
+
+  // fetch remote non-pictrs images for persistent thumbnail link
+  // TODO: should limit size once supported by pictrs
+  let fetch_url = format!(
+    "{}image/download?url={}&resize={}",
+    pictrs_config.url,
+    encode(image_url.as_str()),
+    context.settings().pictrs_config()?.max_thumbnail_size
+  );
+
+  let res = context
+    .client()
+    .get(&fetch_url)
+    .timeout(REQWEST_TIMEOUT)
+    .send()
+    .await?
+    .json::<PictrsResponse>()
+    .await?;
+
+  let files = res.files.unwrap_or_default();
+
+  let image = files
+    .first()
+    .ok_or(LemmyErrorType::PictrsResponseError(res.msg))?;
+
+  let form = LocalImageForm {
+    // This is none because its an internal request.
+    // IE, a local user shouldn't get to delete the thumbnails for their link posts
+    local_user_id: None,
+    pictrs_alias: image.file.clone(),
+    pictrs_delete_token: image.delete_token.clone(),
+  };
+  let protocol_and_hostname = context.settings().get_protocol_and_hostname();
+  let thumbnail_url = image.thumbnail_url(&protocol_and_hostname)?;
+
+  // Also store the details for the image
+  let details_form = image.details.build_image_details_form(&thumbnail_url);
+  LocalImage::create(&mut context.pool(), &form, &details_form).await?;
+
+  Ok(thumbnail_url)
+}
+
+/// Fetches the image details for pictrs proxied images
+///
+/// We don't need to check for image mode, as that's already been done
+#[tracing::instrument(skip_all)]
+pub async fn fetch_pictrs_proxied_image_details(
+  image_url: &Url,
+  context: &LemmyContext,
+) -> LemmyResult<PictrsFileDetails> {
+  validate_link_ip(image_url, context.settings()).await?;
+  let pictrs_url = context.settings().pictrs_config()?.url;
+  let encoded_image_url = encode(image_url.as_str());
+
+  // Pictrs needs you to fetch the proxied image before you can fetch the details
+  let proxy_url = format!("{pictrs_url}image/original?proxy={encoded_image_url}");
+
+  let res = context
+    .client()
+    .get(&proxy_url)
+    .timeout(REQWEST_TIMEOUT)
+    .send()
+    .await?
+    .status();
+  if !res.is_success() {
+    Err(LemmyErrorType::NotAnImageType)?
+  }
+
+  let details_url = format!("{pictrs_url}image/details/original?proxy={encoded_image_url}");
+
+  let res = context
+    .client()
+    .get(&details_url)
+    .timeout(REQWEST_TIMEOUT)
+    .send()
+    .await?
+    .json()
+    .await?;
+
+  Ok(res)
+}
+
+// TODO: get rid of this by reading content type from db
+#[tracing::instrument(skip_all)]
+async fn is_image_content_type(client: &ClientWithMiddleware, url: &Url) -> LemmyResult<()> {
+  let response = client.get(url.as_str()).send().await?;
+  if response
+    .headers()
+    .get("Content-Type")
+    .ok_or(LemmyErrorType::NoContentTypeHeader)?
+    .to_str()?
+    .starts_with("image/")
+  {
+    Ok(())
+  } else {
+    Err(LemmyErrorType::NotAnImageType)?
+  }
+}
+
+// Ignores errors because images may have been stored externally.
+async fn delete_old_image(
+  context: &Data<LemmyContext>,
+  local_user: &LocalUser,
+  image_url: &DbUrl,
+) -> LemmyResult<()> {
+  let image = LocalImage::delete_by_url_and_user(&mut context.pool(), local_user, image_url)
+    .await
+    .ok();
+  if let Some(image) = image {
+    delete_image_from_pictrs(&image.pictrs_alias, &image.pictrs_delete_token, context).await?
+  }
+  Ok(())
+}
+
+/// When adding a new avatar, banner or similar image, delete the old one.
+pub async fn replace_image(
+  new_image: &Option<Option<DbUrl>>,
+  old_image: &Option<DbUrl>,
+  context: &Data<LemmyContext>,
+  local_user: &LocalUser,
+) -> LemmyResult<()> {
+  if let Some(old_image) = old_image {
+    if *new_image == Some(None) {
+      delete_old_image(context, local_user, old_image).await?;
+    } else if let Some(Some(new_image)) = new_image {
+      // Note: Oftentimes front ends will include the current image in the form.
+      // In this case, deleting `old_image` would also be deletion of `new_image`,
+      // so the deletion must be skipped for the image to be kept.
+      if new_image != old_image {
+        delete_old_image(context, local_user, old_image).await?;
+      }
+    }
+  }
+  Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::indexing_slicing)]
+mod tests {
+
+  use crate::{
+    context::LemmyContext,
+    request::{
+      allow_hosts,
+      extract_opengraph_data,
+      fetch_link_metadata,
+      normalize_host,
+      resolve_and_validate_host,
+      v4_is_invalid,
+      v6_is_invalid,
+    },
+  };
+  use lemmy_utils::settings::structs::Settings;
+  use pretty_assertions::assert_eq;
+  use serial_test::serial;
+  use url::Url;
+
+  // These helped with testing
+  #[tokio::test]
+  #[serial]
+  async fn test_link_metadata() {
+    let context = LemmyContext::init_test_context().await;
+    let sample_url = Url::parse("https://gitlab.com/IzzyOnDroid/repo/-/wikis/FAQ").unwrap();
+    let sample_res = fetch_link_metadata(&sample_url, &context, false)
+      .await
+      .unwrap();
+    assert_eq!(
+      Some("FAQ · Wiki · IzzyOnDroid / repo · GitLab".to_string()),
+      sample_res.opengraph_data.title
+    );
+    assert_eq!(
+      Some("The F-Droid compatible repo at https://apt.izzysoft.de/fdroid/".to_string()),
+      sample_res.opengraph_data.description
+    );
+    assert!(sample_res
+      .opengraph_data
+      .image
+      .unwrap()
+      .to_string()
+      .starts_with("https://gitlab.com/uploads/-/system/project/avatar/"));
+    assert_eq!(None, sample_res.opengraph_data.embed_video_url);
+    assert_eq!(
+      Some(mime::TEXT_HTML_UTF_8.to_string()),
+      sample_res.content_type
+    );
+  }
+
+  #[test]
+  fn test_resolve_image_url() {
+    // url that lists the opengraph fields
+    let url = Url::parse("https://example.com/one/two.html").unwrap();
+
+    // root relative url
+    let html_bytes = b"<!DOCTYPE html><html><head><meta property='og:image' content='/image.jpg'></head><body></body></html>";
+    let metadata = extract_opengraph_data(html_bytes, &url).expect("Unable to parse metadata");
+    assert_eq!(
+      metadata.image,
+      Some(Url::parse("https://example.com/image.jpg").unwrap().into())
+    );
+
+    // base relative url
+    let html_bytes = b"<!DOCTYPE html><html><head><meta property='og:image' content='image.jpg'></head><body></body></html>";
+    let metadata = extract_opengraph_data(html_bytes, &url).expect("Unable to parse metadata");
+    assert_eq!(
+      metadata.image,
+      Some(
+        Url::parse("https://example.com/one/image.jpg")
+          .unwrap()
+          .into()
+      )
+    );
+
+    // absolute url
+    let html_bytes = b"<!DOCTYPE html><html><head><meta property='og:image' content='https://cdn.host.com/image.jpg'></head><body></body></html>";
+    let metadata = extract_opengraph_data(html_bytes, &url).expect("Unable to parse metadata");
+    assert_eq!(
+      metadata.image,
+      Some(Url::parse("https://cdn.host.com/image.jpg").unwrap().into())
+    );
+
+    // protocol relative url
+    let html_bytes = b"<!DOCTYPE html><html><head><meta property='og:image' content='//example.com/image.jpg'></head><body></body></html>";
+    let metadata = extract_opengraph_data(html_bytes, &url).expect("Unable to parse metadata");
+    assert_eq!(
+      metadata.image,
+      Some(Url::parse("https://example.com/image.jpg").unwrap().into())
+    );
+  }
+
+  #[test]
+  fn test_invalid_ipv4() {
+    for ip in [
+      "0.0.0.1",    // this network, reaches loopback on Linux
+      "10.0.0.1",   // private
+      "100.64.0.1", // CGNAT
+      "100.127.255.254",
+      "127.0.0.1",       // loopback
+      "169.254.1.1",     // link-local, cloud metadata endpoint
+      "172.16.0.1",      // private
+      "192.0.2.1",       // documentation
+      "224.0.0.1",       // multicast
+      "240.0.0.1",       // reserved
+      "255.255.255.255", // broadcast
+    ] {
+      assert!(v4_is_invalid(ip.parse().unwrap()), "{ip}");
+    }
+  }
+
+  #[test]
+  fn test_valid_ipv4() {
+    for ip in [
+      "1.2.3.4",
+      "8.8.8.8",
+      "100.128.0.1", // just above CGNAT
+      "192.0.0.9",   // globally reachable IETF protocol assignments
+      "192.0.0.10",
+      // not checked because they cannot reach internal services
+      "192.0.0.1",   // IETF protocol assignments
+      "192.88.99.1", // 6to4 relay anycast (deprecated)
+      "198.18.0.1",  // benchmarking
+    ] {
+      assert!(!v4_is_invalid(ip.parse().unwrap()), "{ip}");
+    }
+  }
+
+  #[test]
+  fn test_invalid_ipv6() {
+    for ip in [
+      "::1",              // loopback
+      "fc00::1",          // unique local
+      "fe80::1",          // link-local
+      "ff01::1",          // multicast
+      "2001:db8::1",      // documentation
+      "3fff:10::1",       // documentation
+      "::ffff:127.0.0.1", // IPv4-mapped
+      "::7f00:1",         // IPv4-compatible (deprecated)
+      "64:ff9b::7f00:1",  // NAT64, embedded loopback
+      "64:ff9b::10.0.0.1",
+      "64:ff9b:1::1",    // local-use NAT64 prefix
+      "2002:7f00:1::",   // 6to4 (deprecated)
+      "2002:c0a8:101::", // 6to4, embedded 192.168.1.1
+    ] {
+      assert!(v6_is_invalid(ip.parse().unwrap()), "{ip}");
+    }
+  }
+
+  #[test]
+  fn test_valid_ipv6() {
+    for ip in [
+      "2606:4700::1",
+      // NAT64 with embedded public IP, keeps IPv6-only hosts using DNS64/NAT64 working
+      "64:ff9b::801:1010",
+      // IETF protocol assignment exceptions (public anycast)
+      "2001:1::1",
+      "2001:3::1",
+      "2001:20::1",
+      // not checked because they cannot reach internal services
+      "2001::1",     // Teredo
+      "2001:100::1", // IETF protocol assignments
+      "100::1",      // discard-only
+      "5f00::1",     // segment routing
+    ] {
+      assert!(!v6_is_invalid(ip.parse().unwrap()), "{ip}");
+    }
+  }
+
+  #[test]
+  fn test_normalize_host() {
+    assert_eq!("example.com", normalize_host("example.com"));
+    assert_eq!("example.com", normalize_host("EXAMPLE.COM."));
+    assert_eq!("localhost", normalize_host("localhost:8080"));
+    assert_eq!("::1", normalize_host("[::1]:8080"));
+    assert_eq!("::1", normalize_host("[::1]"));
+    assert_eq!("::1", normalize_host("::1"));
+    assert_eq!("2001:db8::1", normalize_host("2001:DB8::1."));
+  }
+
+  #[test]
+  fn test_allow_hosts() {
+    let allow_hosts = allow_hosts(&Settings::default());
+    assert!(allow_hosts.contains(&("localhost".to_owned(), 8080u16)));
+    assert!(!allow_hosts.contains(&("internal.attacker.com".to_owned(), 80u16)));
+  }
+
+  #[tokio::test]
+  async fn test_resolver_path_allowlisted_host() {
+    let settings = Settings::default();
+    // Debug builds skip validation, so this only checks that resolution succeeds.
+    let addrs = resolve_and_validate_host("localhost", None, &settings)
+      .await
+      .expect("allowlisted host should resolve");
+    assert!(!addrs.is_empty());
+  }
+}

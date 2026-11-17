@@ -1,0 +1,121 @@
+use activitypub_federation::config::Data;
+use actix_web::web::Json;
+use diesel_async::{scoped_futures::ScopedFutureExt, AsyncConnection};
+use lemmy_api_common::{
+  context::LemmyContext,
+  site::{ApproveRegistrationApplication, RegistrationApplicationResponse},
+  utils::{get_interface_language_from_settings, is_admin},
+};
+use lemmy_db_schema::{
+  source::{
+    local_user::{LocalUser, LocalUserUpdateForm},
+    registration_application::{RegistrationApplication, RegistrationApplicationUpdateForm},
+  },
+  traits::Crud,
+  utils::{diesel_string_update, get_conn},
+};
+use lemmy_db_views::structs::{LocalUserView, RegistrationApplicationView};
+use lemmy_utils::{
+  email::send_email,
+  error::{LemmyError, LemmyResult},
+  settings::structs::Settings,
+  utils::markdown::markdown_to_html,
+  LemmyErrorType,
+};
+
+pub async fn approve_registration_application(
+  data: Json<ApproveRegistrationApplication>,
+  context: Data<LemmyContext>,
+  local_user_view: LocalUserView,
+) -> LemmyResult<Json<RegistrationApplicationResponse>> {
+  let app_id = data.id;
+
+  // Only let admins do this
+  is_admin(&local_user_view)?;
+
+  let pool = &mut context.pool();
+  let conn = &mut get_conn(pool).await?;
+  let tx_data = data.clone();
+  let approved_user_id = conn
+    .transaction::<_, LemmyError, _>(|conn| {
+      async move {
+        // Update the registration with reason, admin_id
+        let deny_reason = diesel_string_update(tx_data.deny_reason.as_deref());
+        let app_form = RegistrationApplicationUpdateForm {
+          admin_id: Some(Some(local_user_view.person.id)),
+          deny_reason,
+        };
+
+        let registration_application =
+          RegistrationApplication::update(&mut conn.into(), app_id, &app_form).await?;
+
+        // Update the local_user row
+        let local_user_form = LocalUserUpdateForm {
+          accepted_application: Some(tx_data.approve),
+          ..Default::default()
+        };
+
+        let approved_user_id = registration_application.local_user_id;
+        LocalUser::update(&mut conn.into(), approved_user_id, &local_user_form).await?;
+
+        Ok(approved_user_id)
+      }
+      .scope_boxed()
+    })
+    .await?;
+
+  let approved_local_user_view = LocalUserView::read(&mut context.pool(), approved_user_id)
+    .await?
+    .ok_or(LemmyErrorType::CouldntFindLocalUser)?;
+  if approved_local_user_view.local_user.email.is_some() {
+    // Email sending may fail, but this won't revert the application approval
+    if data.approve {
+      send_application_approved_email(&approved_local_user_view, context.settings()).await?;
+    } else {
+      send_application_denied_email(
+        &approved_local_user_view,
+        context.settings(),
+        data.deny_reason.clone(),
+      )
+      .await?;
+    }
+  }
+
+  // Read the view
+  let registration_application = RegistrationApplicationView::read(&mut context.pool(), app_id)
+    .await?
+    .ok_or(LemmyErrorType::CouldntFindRegistrationApplication)?;
+
+  Ok(Json(RegistrationApplicationResponse {
+    registration_application,
+  }))
+}
+
+async fn send_application_approved_email(
+  user: &LocalUserView,
+  settings: &Settings,
+) -> LemmyResult<()> {
+  let email = &user.local_user.email.clone().expect("email");
+  let lang = get_interface_language_from_settings(user);
+  let subject = lang.registration_approved_subject(&user.person.actor_id);
+  let body = lang.registration_approved_body(&settings.hostname);
+  send_email(&subject, email, &user.person.name, &body, settings).await
+}
+
+async fn send_application_denied_email(
+  user: &LocalUserView,
+  settings: &Settings,
+  deny_reason: Option<String>,
+) -> LemmyResult<()> {
+  let email = &user.local_user.email.clone().expect("email");
+  let lang = get_interface_language_from_settings(user);
+  let subject = lang.registration_denied_subject(&user.person.name);
+  let body = match deny_reason {
+    Some(deny_reason) => {
+      let markdown = markdown_to_html(&deny_reason);
+      lang.registration_denied_reason_body(&settings.hostname, &markdown)
+    }
+    None => lang.registration_denied_body(&settings.hostname),
+  };
+  send_email(&subject, email, &user.person.name, &body, settings).await
+}

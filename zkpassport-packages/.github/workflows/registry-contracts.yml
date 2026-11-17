@@ -1,0 +1,51 @@
+name: Registry Contracts
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+env:
+  FOUNDRY_PROFILE: ci
+
+jobs:
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.4.4
+
+      - name: Install Foundry dependencies
+        if: github.ref == 'refs/heads/main'
+        run: forge install
+        working-directory: packages/registry-contracts
+
+      - name: Show Forge version
+        run: forge --version
+        working-directory: packages/registry-contracts
+
+      - name: Run checks
+        id: check
+        run: |
+          forge fmt --check
+          forge lint src
+        working-directory: packages/registry-contracts
+
+      - name: Build contracts
+        id: build
+        run: forge build --sizes
+        working-directory: packages/registry-contracts
+
+      - name: Run tests
+        id: test
+        run: forge test -vvv
+        working-directory: packages/registry-contracts

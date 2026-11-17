@@ -1,0 +1,40 @@
+# Ignored folders
+.worktrees
+.build
+.cache
+target
+log
+logs
+coverage
+__pycache__
+node_modules
+build
+dist
+out
+res
+.next
+.env
+.yarn
+.turbo
+
+# Foundry specific
+cache/
+artifacts/
+broadcast/
+
+# Ignored files
+*.DS_Store
+*.env*
+*.log*
+*.a
+*.so
+*.zip
+*.tgz
+*.bak
+*.eslintcache
+*.tsbuildinfo
+next-env.d.ts
+.github/test-ci-locally.sh
+
+# Superpowers working documents (specs/plans live outside the repo)
+docs/superpowers/

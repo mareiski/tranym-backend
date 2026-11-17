@@ -1,0 +1,132 @@
+import { getNetworkConstants } from "./networks"
+import { normaliseHash } from "./utils"
+
+/**
+ * Default number of retries for fetching data
+ */
+export const DEFAULT_RETRY_COUNT = 3
+
+/**
+ * Certificate Registry ID
+ * Used to identify the certificate registry in the root registry
+ */
+export const CERTIFICATE_REGISTRY_ID = 1
+
+/**
+ * Packaged certificates URL generator
+ * @param chainId - The chain ID
+ * @param root - The certificates root hash
+ * @param cid - The CID of the packaged certificates (optional)
+ */
+export const PACKAGED_CERTIFICATES_URL_TEMPLATE = (chainId: number, root: string, cid?: string) => {
+  if (cid) {
+    return `https://ipfs.zkpassport.id/ipfs/${cid}`
+  }
+  root = normaliseHash(root)
+  return `${getNetworkConstants(chainId).packagedCertificatesUrl}/${root}.json`
+}
+
+/**
+ * Serialised sanctions tree URLs
+ */
+export const SANCTIONS_TREE_URL_MAINNET = "https://sanctions.zkpassport.id/mainnet"
+export const SANCTIONS_TREE_URL_TESTNET = "https://sanctions.zkpassport.id/testnet"
+export const SANCTIONS_TREE_URL_DEV = "http://localhost:8000/sanctions"
+
+/**
+ * Serialised sanctions tree URL generator
+ * @param chainId - The chain ID
+ * @param root - The sanctions root hash
+ */
+export const SANCTIONS_TREE_URL_TEMPLATE = (chainId: number, root: string) => {
+  root = normaliseHash(root)
+  if (chainId === 1 || chainId === 8453) {
+    return `${SANCTIONS_TREE_URL_MAINNET}/${root}.tree.json.gz`
+  } else if (chainId === 11155111) {
+    return `${SANCTIONS_TREE_URL_TESTNET}/${root}.tree.json.gz`
+  } else {
+    return `${SANCTIONS_TREE_URL_DEV}/${root}.tree.json.gz`
+  }
+}
+
+/**
+ * Circuit manifest URL generator
+ * @param chainId - The chain ID
+ * @param root - The circuit manifest root hash
+ * @param version - The circuit manifest version
+ * @param cid - The CID of the circuit manifest (optional)
+ */
+export const CIRCUIT_MANIFEST_URL_TEMPLATE = (
+  chainId: number,
+  { root, version, cid }: { root?: string; version?: string; cid?: string },
+) => {
+  if (root) {
+    root = normaliseHash(root)
+    return `${getNetworkConstants(chainId).circuitUrl}/by-root/${root}/manifest.json`
+  } else if (version) {
+    return `${getNetworkConstants(chainId).circuitUrl}/by-version/${version}/manifest.json`
+  } else if (cid) {
+    return `https://ipfs.zkpassport.id/ipfs/${cid}`
+  } else {
+    throw new Error("No root, version or cid provided")
+  }
+}
+
+/**
+ * Packaged circuit URL generator
+ * @param chainId - The chain ID
+ * @param hash - The circuit vkey hash
+ * @param cid - The CID of the packaged circuit (optional)
+ */
+export const PACKAGED_CIRCUIT_URL_TEMPLATE = (chainId: number, hash: string, cid?: string) => {
+  if (cid) {
+    return `https://ipfs.zkpassport.id/ipfs/${cid}`
+  }
+  hash = normaliseHash(hash)
+  return `${getNetworkConstants(chainId).circuitUrl}/by-hash/${hash}.json`
+}
+
+/**
+ * Default page size for historical roots results
+ */
+export const DEFAULT_HISTORICAL_ROOTS_PAGE_SIZE = 100
+
+/**
+ * Function signature for latestRoot()
+ */
+export const LATEST_ROOT_SIGNATURE = "0xd7b0fef1"
+
+/**
+ * Function signature for latestRoot(bytes32)
+ */
+export const LATEST_ROOT_WITH_PARAM_SIGNATURE = "0xc3bc16e8"
+
+/**
+ * Function signature for getHistoricalRoots(bytes32,uint256,uint256)
+ */
+export const GET_HISTORICAL_ROOTS_SIGNATURE = "0x06ac4103"
+
+/**
+ * Function signature for getHistoricalRootsByHash(bytes32,bytes32,uint256)
+ */
+export const GET_HISTORICAL_ROOTS_BY_HASH_SIGNATURE = "0xcb0c82c7"
+
+/**
+ * Function signature for getLatestRootDetails(bytes32)
+ */
+export const GET_LATEST_ROOT_DETAILS_SIGNATURE = "0x76785af8"
+
+/**
+ * Function signature for registries(bytes32)
+ */
+export const REGISTRIES_MAPPING_SIGNATURE = "0x5d8d57a6"
+
+/**
+ * Function signature for getRootDetailsByRoot(bytes32,bytes32)
+ */
+export const GET_ROOT_DETAILS_BY_ROOT_SIGNATURE = "0xbb3dd539"
+
+/**
+ * Function signature for isRootValid(bytes32,bytes32,uint256)
+ */
+export const IS_ROOT_VALID_SIGNATURE = "0x2aae4296"

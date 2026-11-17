@@ -1,0 +1,91 @@
+import type { QueryBuilder, QueryBuilderResult, ZKPassport } from "@zkpassport/sdk"
+
+type SdkCallback<K extends keyof QueryBuilderResult> = QueryBuilderResult[K] extends (
+  cb: infer C,
+) => void
+  ? C
+  : never
+
+type SdkRequestProps = Omit<
+  Parameters<ZKPassport["request"]>[0],
+  "projectID" | "topicOverride" | "keyPairOverride" | "cloudProverUrl" | "bridgeUrl"
+>
+
+// Toggles for optional card sections. Each defaults to shown; set false to hide.
+export type ZKPassportQRCodeDisplayOptions = {
+  // ZKPassport mark, app logo, and the "… uses ZKPassport …" intro line.
+  header?: boolean
+  // The numbered verification steps (1–5).
+  steps?: boolean
+  // The "ZKPassport App" footer with the App Store / Google Play download links.
+  appLinks?: boolean
+  // The card's own box (border, padding, min height); false embeds the card in your own frame.
+  frame?: boolean
+}
+
+export type ZKPassportQRCodeOptions = SdkRequestProps & {
+  domain?: string
+  theme?: "light" | "dark" | "auto"
+  display?: ZKPassportQRCodeDisplayOptions
+  showIntroScreen?: boolean
+  query: (queryBuilder: QueryBuilder) => QueryBuilderResult
+  onReady?: () => void
+  onRetryClicked?: () => void
+  onBridgeConnect?: SdkCallback<"onBridgeConnect">
+  onRequestReceived?: SdkCallback<"onRequestReceived">
+  onGeneratingProof?: SdkCallback<"onGeneratingProof">
+  onProofGenerated?: SdkCallback<"onProofGenerated">
+  /**
+   * All proofs arrived (not verified yet — verify them on your backend).
+   * The component waits for this callback: return `false` (or throw) to show the error state.
+   */
+  onSuccess?: SdkCallback<"onSuccess">
+  /** @deprecated Use `onSuccess` and verify the proofs on your backend. */
+  onResult?: SdkCallback<"onResult">
+  onReject?: SdkCallback<"onReject">
+  onError?: SdkCallback<"onError">
+}
+
+export type QRCardHandle = {
+  update(next: ZKPassportQRCodeOptions): void
+  retry(): void
+  unmount(): void
+}
+
+// Re-export essential types
+export {
+  ZKPassport,
+  VERSION as SDK_VERSION,
+  NullifierType,
+  NullifierType as UniqueIdentifierType,
+  ProofType,
+  ProofTypeLength,
+  SANCTIONED_COUNTRIES,
+  EU_COUNTRIES,
+  EEA_COUNTRIES,
+  SCHENGEN_COUNTRIES,
+  ASEAN_COUNTRIES,
+  MERCOSUR_COUNTRIES,
+} from "@zkpassport/sdk"
+
+export type {
+  QueryBuilder,
+  QueryBuilderResult,
+  ProofResult,
+  QueryResult,
+  QueryResultError,
+  QueryResultErrors,
+  Query,
+  IDCredential,
+  DisclosableIDCredential,
+  IDCredentialValue,
+  NumericalIDCredential,
+  CountryName,
+  FacematchMode,
+  SanctionsCountries,
+  SanctionsLists,
+  SupportedChain,
+  ProofMode,
+  BoundData,
+  Service,
+} from "@zkpassport/sdk"
