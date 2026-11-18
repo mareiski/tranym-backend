@@ -47,6 +47,8 @@ services:
       # prometheus metrics can be enabled with the `prometheus` config option. they are available on
       # port 10002, path /metrics by default
       - "10002:10002"
+    volumes:
+      - lemmy-config:/config
     depends_on:
       - postgres
       - pictrs
@@ -134,3 +136,6 @@ services:
       - ./customPostgresql.conf:/etc/postgresql.conf:Z
     restart: unless-stopped
     logging: *default-logging
+
+volumes:
+  lemmy-config:
