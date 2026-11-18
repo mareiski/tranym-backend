@@ -26,10 +26,12 @@ RUN mkdir -p /app/node_modules/@zkpassport \
 
 # Build CommonJS and ESM outputs required by package exports.
 RUN cd /zkpassport-packages/packages/zkpassport-utils \
-    && GENERATE_DTS=false /app/node_modules/.bin/tsup --config tsup.config.ts \
-    && cd /zkpassport-packages/packages/registry-sdk \
-    && GENERATE_DTS=false /app/node_modules/.bin/tsup --config tsup.config.ts \
-    && cd /zkpassport-packages/packages/zkpassport-sdk \
+    && GENERATE_DTS=false /app/node_modules/.bin/tsup --config tsup.config.ts
+
+RUN cd /zkpassport-packages/packages/registry-sdk \
+    && GENERATE_DTS=false /app/node_modules/.bin/tsup --config tsup.config.ts
+
+RUN cd /zkpassport-packages/packages/zkpassport-sdk \
     && GENERATE_DTS=false /app/node_modules/.bin/tsup --config tsup.config.ts
 
 COPY passport_verification/src ./src
