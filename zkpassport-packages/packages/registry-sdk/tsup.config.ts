@@ -1,15 +1,18 @@
 import { defineConfig } from "tsup"
 
 const isDev = process.env.DEV_BUILD === "true"
+const generateDts = process.env.GENERATE_DTS !== "false"
 
 export default defineConfig(
   (["esm", "cjs"] as const).map((format) => ({
     entry: ["src/index.ts", "src/mock-client.ts"],
-    dts: {
-      compilerOptions: {
-        composite: false,
-      },
-    },
+    dts: generateDts
+      ? {
+          compilerOptions: {
+            composite: false,
+          },
+        }
+      : false,
     clean: true,
     format,
     outDir: `dist/${format}`,

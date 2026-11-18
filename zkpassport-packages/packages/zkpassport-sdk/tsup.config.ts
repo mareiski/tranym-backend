@@ -1,6 +1,7 @@
 import { defineConfig } from "tsup"
 
 const isDev = process.env.DEV_BUILD === "true"
+const generateDts = process.env.GENERATE_DTS !== "false"
 
 export default defineConfig(
   (["esm", "cjs"] as const).map((format) => ({
@@ -9,11 +10,13 @@ export default defineConfig(
       popup: "src/popup/index.ts",
       query: "src/offline-query.ts",
     },
-    dts: {
-      compilerOptions: {
-        composite: false,
-      },
-    },
+    dts: generateDts
+      ? {
+          compilerOptions: {
+            composite: false,
+          },
+        }
+      : false,
     clean: true,
     format,
     outDir: `dist/${format}`,
