@@ -13,6 +13,7 @@ COPY --exclude=node_modules zkpassport-packages/packages/zkpassport-sdk /zkpassp
 COPY --exclude=node_modules zkpassport-packages/packages/zkpassport-ui /zkpassport-packages/packages/zkpassport-ui
 COPY --exclude=node_modules zkpassport-packages/packages/registry-sdk /zkpassport-packages/packages/registry-sdk
 COPY --exclude=node_modules zkpassport-packages/packages/zkpassport-utils /zkpassport-packages/packages/zkpassport-utils
+COPY zkpassport-packages/tsconfig.packages.json /zkpassport-packages/tsconfig.packages.json
 RUN npm install --omit=dev --prefix /zkpassport-packages/packages/zkpassport-utils
 RUN npm ci --include=dev --legacy-peer-deps
 
@@ -21,6 +22,7 @@ RUN npm ci --include=dev --legacy-peer-deps
 RUN mkdir -p /app/node_modules/@zkpassport \
     && ln -sfn /zkpassport-packages/packages/zkpassport-utils /app/node_modules/@zkpassport/utils \
     && ln -sfn /zkpassport-packages/packages/registry-sdk /app/node_modules/@zkpassport/registry \
+    && ln -sfn /app/node_modules/tsup /zkpassport-packages/packages/zkpassport-utils/node_modules/tsup \
     && ln -sfn /app/node_modules /zkpassport-packages/packages/zkpassport-sdk/node_modules \
     && ln -sfn /app/node_modules /zkpassport-packages/packages/registry-sdk/node_modules
 
