@@ -15,7 +15,6 @@ COPY --exclude=node_modules zkpassport-packages/packages/registry-sdk /zkpasspor
 COPY --exclude=node_modules zkpassport-packages/packages/zkpassport-utils /zkpassport-packages/packages/zkpassport-utils
 RUN npm install --omit=dev --prefix /zkpassport-packages/packages/zkpassport-utils
 RUN npm ci --include=dev --legacy-peer-deps
-RUN npm install --prefix /app --no-save tsup@8.5.0 rimraf@6.0.1 @zkpassport/poseidon2@0.6.2
 
 # The local SDK packages resolve imports from their own directory. Share the
 # verifier's installed modules with them and expose the local workspace packages.
