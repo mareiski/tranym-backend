@@ -13,7 +13,6 @@ COPY --exclude=node_modules zkpassport-packages/packages/zkpassport-sdk /zkpassp
 COPY --exclude=node_modules zkpassport-packages/packages/zkpassport-ui /zkpassport-packages/packages/zkpassport-ui
 COPY --exclude=node_modules zkpassport-packages/packages/registry-sdk /zkpassport-packages/packages/registry-sdk
 COPY --exclude=node_modules zkpassport-packages/packages/zkpassport-utils /zkpassport-packages/packages/zkpassport-utils
-COPY photon/node_modules/.bun/@zkpassport+poseidon2@0.6.2/node_modules/@zkpassport/poseidon2 /zkpassport-packages/packages/poseidon2
 RUN npm install --omit=dev --prefix /zkpassport-packages/packages/zkpassport-utils
 RUN npm ci --include=dev --legacy-peer-deps
 
@@ -22,8 +21,6 @@ RUN npm ci --include=dev --legacy-peer-deps
 RUN mkdir -p /app/node_modules/@zkpassport \
     && ln -sfn /zkpassport-packages/packages/zkpassport-utils /app/node_modules/@zkpassport/utils \
     && ln -sfn /zkpassport-packages/packages/registry-sdk /app/node_modules/@zkpassport/registry \
-    && ln -sfn /zkpassport-packages/packages/poseidon2 /app/node_modules/@zkpassport/poseidon2 \
-    && ln -sfn /zkpassport-packages/packages/poseidon2 /zkpassport-packages/packages/zkpassport-utils/node_modules/@zkpassport/poseidon2 \
     && ln -sfn /app/node_modules /zkpassport-packages/packages/zkpassport-sdk/node_modules \
     && ln -sfn /app/node_modules /zkpassport-packages/packages/registry-sdk/node_modules
 

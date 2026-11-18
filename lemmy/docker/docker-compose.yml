@@ -41,12 +41,12 @@ services:
       - RUST_LOG="warn,lemmy_server=debug,lemmy_api=debug,lemmy_api_common=debug,lemmy_api_crud=debug,lemmy_apub=debug,lemmy_db_schema=debug,lemmy_db_views=debug,lemmy_db_views_actor=debug,lemmy_db_views_moderator=debug,lemmy_routes=debug,lemmy_utils=debug,lemmy_websocket=debug"
       - RUST_BACKTRACE=full
       - ZKPASSPORT_VERIFY_URL=${ZKPASSPORT_VERIFY_URL:-http://passport-verification:3100/verify}
+      - ZKPASSPORT_INTERNAL_SECRET=${ZKPASSPORT_INTERNAL_SECRET}
+      - LEMMY_CORS_ORIGIN=${LEMMY_CORS_ORIGIN}
     ports:
       # prometheus metrics can be enabled with the `prometheus` config option. they are available on
       # port 10002, path /metrics by default
       - "10002:10002"
-    env_file:
-      - ../.env
     volumes:
       - ./lemmy.hjson:/config/config.hjson:Z
     depends_on:
@@ -59,11 +59,12 @@ services:
     build:
       context: ../..
       dockerfile: passport_verification/Dockerfile
-    env_file:
-      - ../../passport_verification/.env
     environment:
       - PORT=3100
       - ZKPASSPORT_HOST=0.0.0.0
+      - ZKPASSPORT_DOMAIN=${ZKPASSPORT_DOMAIN}
+      - ZKPASSPORT_INTERNAL_SECRET=${ZKPASSPORT_INTERNAL_SECRET}
+      - NODE_ENV=production
     restart: unless-stopped
     logging: *default-logging
 
@@ -82,8 +83,8 @@ services:
       - LEMMY_UI_LEMMY_INTERNAL_HOST=lemmy:8536
       - LEMMY_UI_BACKEND_INTERNAL=lemmy:8536
       # set the outside hostname here
-      - LEMMY_UI_LEMMY_EXTERNAL_HOST=localhost:1236
-      - LEMMY_UI_HTTPS=false
+      - LEMMY_UI_LEMMY_EXTERNAL_HOST=${LEMMY_UI_LEMMY_EXTERNAL_HOST:-localhost:1236}
+      - LEMMY_UI_HTTPS=true
       - LEMMY_UI_DEBUG=true
       - LEMMY_UI_DISABLE_CSP=true
     depends_on:
