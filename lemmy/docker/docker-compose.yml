@@ -4,6 +4,10 @@ x-logging: &default-logging
     max-size: "50m"
     max-file: "4"
 
+configs:
+  nginx_conf:
+    file: ./nginx.conf
+
 services:
   proxy:
     image: nginx:1-alpine
@@ -13,8 +17,9 @@ services:
       # You could use port 80 if you won't use a reverse proxy
       - "1236:1236"
       - "8536:8536"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro,Z
+    configs:
+      - source: nginx_conf
+        target: /etc/nginx/nginx.conf
     restart: unless-stopped
     depends_on:
       - pictrs
@@ -47,8 +52,6 @@ services:
       # prometheus metrics can be enabled with the `prometheus` config option. they are available on
       # port 10002, path /metrics by default
       - "10002:10002"
-    volumes:
-      - ./lemmy.hjson:/config/config.hjson:Z
     depends_on:
       - postgres
       - pictrs
