@@ -4,22 +4,17 @@ x-logging: &default-logging
     max-size: "50m"
     max-file: "4"
 
-configs:
-  nginx_conf:
-    file: ./nginx.conf
-
 services:
   proxy:
-    image: nginx:1-alpine
+    build:
+      context: .
+      dockerfile: nginx.Dockerfile
     ports:
       # actual and only port facing any connection from outside
       # Note, change the left number if port 1236 is already in use on your system
       # You could use port 80 if you won't use a reverse proxy
       - "1236:1236"
       - "8536:8536"
-    configs:
-      - source: nginx_conf
-        target: /etc/nginx/nginx.conf
     restart: unless-stopped
     depends_on:
       - pictrs
