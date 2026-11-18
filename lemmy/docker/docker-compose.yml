@@ -37,9 +37,17 @@ services:
     # this hostname is used in nginx reverse proxy and also for lemmy ui to connect to the backend, do not change
     hostname: lemmy
     restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        : "$${LEMMY_HJSON:?LEMMY_HJSON is required}"
+        printf '%s' "$${LEMMY_HJSON}" > /tmp/config.hjson
+        exec lemmy_server
     environment:
       - RUST_LOG="warn,lemmy_server=debug,lemmy_api=debug,lemmy_api_common=debug,lemmy_api_crud=debug,lemmy_apub=debug,lemmy_db_schema=debug,lemmy_db_views=debug,lemmy_db_views_actor=debug,lemmy_db_views_moderator=debug,lemmy_routes=debug,lemmy_utils=debug,lemmy_websocket=debug"
       - RUST_BACKTRACE=full
+      - LEMMY_CONFIG_LOCATION=/tmp/config.hjson
+      - LEMMY_HJSON=${LEMMY_HJSON}
       - ZKPASSPORT_VERIFY_URL=${ZKPASSPORT_VERIFY_URL:-http://passport-verification:3100/verify}
       - ZKPASSPORT_INTERNAL_SECRET=${ZKPASSPORT_INTERNAL_SECRET}
       - LEMMY_CORS_ORIGIN=${LEMMY_CORS_ORIGIN}
@@ -47,8 +55,6 @@ services:
       # prometheus metrics can be enabled with the `prometheus` config option. they are available on
       # port 10002, path /metrics by default
       - "10002:10002"
-    volumes:
-      - lemmy-config:/config
     depends_on:
       - postgres
       - pictrs
@@ -136,6 +142,3 @@ services:
       - ./customPostgresql.conf:/etc/postgresql.conf:Z
     restart: unless-stopped
     logging: *default-logging
-
-volumes:
-  lemmy-config:
