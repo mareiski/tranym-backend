@@ -72,7 +72,7 @@ async function verifyProofs({
     originalQuery: query,
     queryResult,
     scope: "personhood", // must match the frontend scope
-    devMode: IS_DEV,
+    devMode: true, // TODO IS_DEV,
   });
 
   if (!verified || !uniqueIdentifier) return FAILED;
