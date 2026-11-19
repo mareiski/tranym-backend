@@ -91,7 +91,7 @@ services:
       # set the outside hostname here
       - LEMMY_UI_LEMMY_EXTERNAL_HOST=${LEMMY_UI_LEMMY_EXTERNAL_HOST:-localhost:1236}
       - LEMMY_UI_HTTPS=true
-      - LEMMY_UI_DEBUG=true
+      - LEMMY_UI_DEBUG=false
       - LEMMY_UI_DISABLE_CSP=true
     depends_on:
       - lemmy
