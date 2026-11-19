@@ -99,6 +99,14 @@ services:
     logging: *default-logging
     init: true
 
+  pictrs-permissions:
+    image: alpine:3.20
+    user: "0:0"
+    command: ["sh", "-c", "chown -R 991:991 /mnt"]
+    volumes:
+      - ./volumes/pictrs:/mnt:Z
+    restart: "no"
+
   pictrs:
     image: asonix/pictrs:0.5.16
     # this needs to match the pictrs url in lemmy.hjson
@@ -118,6 +126,9 @@ services:
     user: 991:991
     volumes:
       - ./volumes/pictrs:/mnt:Z
+    depends_on:
+      pictrs-permissions:
+        condition: service_completed_successfully
     restart: unless-stopped
     logging: *default-logging
 
