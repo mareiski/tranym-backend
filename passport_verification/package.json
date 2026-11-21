@@ -14,10 +14,10 @@
     "@aztec-foundation/bb.js": "6.0.0",
     "@aztec/bb.js": "5.0.0",
     "@noir-lang/noir_js": "1.0.0-beta.22",
-    "@obsidion/bridge": "^0.12.3",
-    "@zkpassport/poseidon2": "0.6.2",
-    "@zkpassport/sdk": "file:../zkpassport-packages/packages/zkpassport-sdk",
-    "@zkpassport/ui": "file:../zkpassport-packages/packages/zkpassport-ui",
+    "@zkpassport/registry": "^0.16.0",
+    "@zkpassport/sdk": "^0.21.0",
+    "@zkpassport/ui": "^0.21.0",
+    "@zkpassport/utils": "^0.41.1",
     "buffer": "^6.0.3",
     "cors": "^2.8.5",
     "dotenv": "^18.0.7",
@@ -38,6 +38,6 @@
     "rimraf": "6.0.1",
     "tsup": "8.5.0",
     "tsx": "^4.7.0",
-    "typescript": "^7.0.2"
+    "typescript": "^5.9.3"
   }
 }

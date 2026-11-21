@@ -1,1 +1,0 @@
-# ZKPassport Registry Contracts

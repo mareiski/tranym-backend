@@ -81,6 +81,8 @@ async function verifyProofs({
   const bound = (queryResult as any)?.bind?.custom_data;
   if (typeof bound !== "string" || bound !== expectedNonce) return FAILED;
 
+  console.log("verified userId", uniqueIdentifier);
+
   return { verified: true, userId: uniqueIdentifier };
 }
 

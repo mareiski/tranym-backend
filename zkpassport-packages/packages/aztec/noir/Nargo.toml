@@ -1,2 +1,0 @@
-[workspace]
-members = ["registry_contract", "core"]
