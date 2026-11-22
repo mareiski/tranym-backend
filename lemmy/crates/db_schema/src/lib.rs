@@ -138,6 +138,8 @@ pub enum ListingType {
 pub enum RegistrationMode {
   /// Closed to public.
   Closed,
+  /// Closed to public, but open for passport registration.
+  RequirePassport,
   /// Open, but pending approval of a registration application.
   RequireApplication,
   /// Open to all.

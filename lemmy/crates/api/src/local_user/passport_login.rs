@@ -70,8 +70,10 @@ pub async fn passport_login(
     }
     // No account -> register
     None => {
-     // TODO make another registration mode for passport registration mode closed or open
-      if site_view.local_site.registration_mode != RegistrationMode::Open {
+      if !matches!(
+        site_view.local_site.registration_mode,
+        RegistrationMode::Open | RegistrationMode::RequirePassport
+      ) {
         return Err(LemmyErrorType::RegistrationClosed.into());
       }
       if site_view.local_site.require_email_verification {

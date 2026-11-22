@@ -85,8 +85,12 @@ pub(super) async fn check_registration_application(
   local_site: &LocalSite,
   pool: &mut DbPool<'_>,
 ) -> LemmyResult<()> {
-  if (local_site.registration_mode == RegistrationMode::RequireApplication
-    || local_site.registration_mode == RegistrationMode::Closed)
+  if (matches!(
+    local_site.registration_mode,
+    RegistrationMode::RequireApplication
+      | RegistrationMode::RequirePassport
+      | RegistrationMode::Closed
+  ))
     && !local_user_view.local_user.accepted_application
     && !local_user_view.local_user.admin
   {

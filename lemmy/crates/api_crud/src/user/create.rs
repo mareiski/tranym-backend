@@ -56,7 +56,10 @@ pub async fn register(
   let require_registration_application =
     local_site.registration_mode == RegistrationMode::RequireApplication;
 
-  if local_site.registration_mode == RegistrationMode::Closed {
+  if matches!(
+    local_site.registration_mode,
+    RegistrationMode::Closed | RegistrationMode::RequirePassport
+  ) {
     Err(LemmyErrorType::RegistrationClosed)?
   }
 
