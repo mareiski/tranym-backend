@@ -146,3 +146,17 @@ services:
       - ./customPostgresql.conf:/etc/postgresql.conf:Z
     restart: unless-stopped
     logging: *default-logging
+
+  photon:
+    image: ghcr.io/xyphyn/photon:latest
+    environment:
+      - PUBLIC_INSTANCE_URL=${LEMMY_UI_LEMMY_EXTERNAL_HOST:-localhost:1236}
+
+      - PUBLIC_INSTANCE_TYPE=lemmyv3
+
+      - PUBLIC_MIGRATE_COOKIE=true
+
+    depends_on:
+      - lemmy
+    restart: unless-stopped
+    logging: *default-logging
