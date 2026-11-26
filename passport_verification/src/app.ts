@@ -3,7 +3,12 @@ import express, {
   type Response,
   type NextFunction,
 } from "express";
-import { ProofResult, QueryResult, ZKPassport } from "@zkpassport/sdk";
+import {
+  NullifierType,
+  ProofResult,
+  QueryResult,
+  ZKPassport,
+} from "@zkpassport/sdk";
 import { timingSafeEqual } from "node:crypto";
 import "dotenv/config";
 
@@ -72,7 +77,8 @@ async function verifyProofs({
     originalQuery: query,
     queryResult,
     scope: "personhood", // must match the frontend scope
-    devMode: true, // TODO IS_DEV,
+    devMode: IS_DEV,
+    uniqueIdentifierType: NullifierType.SALTED,
   });
 
   if (!verified || !uniqueIdentifier) return FAILED;
